@@ -13,9 +13,11 @@ API = "https://api.github.com"
 _BOT_MARKER = re.compile(r"\[norne-[^\]]*\]")
 
 
-def bot_marker(model="orchestrator", effort="na"):
-    """The trailing tag stamped on bot comments: `[norne-{model}-{effort}]`."""
-    return f"`[norne-{model}-{effort}]`"
+def bot_marker(model="orchestrator", effort="na", tokens=None):
+    """The trailing tag stamped on bot comments: `[norne-{model}-{effort}]`,
+    with a `-{N}tok` suffix when the comment came from a metered model run."""
+    tok = f"-{tokens}tok" if tokens is not None else ""
+    return f"`[norne-{model}-{effort}{tok}]`"
 
 
 def is_bot_comment(comment):
@@ -84,14 +86,18 @@ class GitHub:
         if flow_label not in current:
             self.add_labels(n, [flow_label])
 
-    def comment(self, n, body, model="orchestrator", effort="na"):
+    def comment(self, n, body, model="orchestrator", effort="na", tokens=None):
         """Post a comment, tagged with the bot marker so we can recognise our own."""
-        body = f"{body}\n\n{bot_marker(model, effort)}"
+        body = f"{body}\n\n{bot_marker(model, effort, tokens)}"
         self.s.post(self._u(f"/issues/{n}/comments"),
                     json={"body": body}).raise_for_status()
 
     def list_comments(self, n):
         return self._get(f"/issues/{n}/comments", params={"per_page": 100})
+
+    def pull_review_comments(self, number):
+        """Inline review comments on a PR's diff (separate from conversation comments)."""
+        return self._get(f"/pulls/{number}/comments", params={"per_page": 100})
 
     def latest_human_comment(self, n):
         """Most recent comment NOT written by the bot. None if last word was ours.

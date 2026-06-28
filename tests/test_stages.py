@@ -11,6 +11,60 @@ from orchestrator.runners import RunResult
 
 
 # ── _specs_text ─────────────────────────────────────────────────────────────
+class FakeGH:
+    """Minimal gh for _discussion: serves issue body + comments + PR data."""
+    def __init__(self, issue, comments, pr=None, pr_comments=None, pr_review=None):
+        self._issue = issue
+        self._comments = comments
+        self._pr = pr
+        self._pr_comments = pr_comments or []
+        self._pr_review = pr_review or []
+
+    def get_issue(self, n):
+        return self._issue
+
+    def list_comments(self, n):
+        return self._pr_comments if (self._pr and n == self._pr["number"]) else self._comments
+
+    def get_pull(self, number):
+        return self._pr
+
+    def pull_review_comments(self, number):
+        return self._pr_review
+
+
+def _cm(body, marker=False):
+    b = body + ("\n\n`[norne-glm-4.7-low]`" if marker else "")
+    return {"id": 1, "body": b, "user": {"login": "x"}}
+
+
+def test_discussion_includes_issue_body_and_all_comments():
+    gh = FakeGH(
+        issue={"title": "T", "body": "the description"},
+        comments=[_cm("human asks"), _cm("bot replied", marker=True)],
+    )
+    out = stages._discussion(gh, 1, issue={"title": "T", "body": "the description"})
+    assert "the description" in out
+    assert "(human) human asks" in out
+    assert "(bot) bot replied" in out          # bot comment labelled, not dropped
+    assert "PULL REQUEST" not in out           # no PR -> no PR section
+
+
+def test_discussion_includes_pr_description_and_comments():
+    gh = FakeGH(
+        issue={"title": "T", "body": "desc"},
+        comments=[_cm("issue comment")],
+        pr={"number": 7, "title": "PR", "body": "pr body"},
+        pr_comments=[_cm("pr convo comment")],
+        pr_review=[_cm("inline review note")],
+    )
+    out = stages._discussion(gh, 1, issue={"title": "T", "body": "desc"}, pr_number=7)
+    assert "PULL REQUEST #7" in out
+    assert "pr body" in out
+    assert "pr convo comment" in out
+    assert "inline review note" in out
+
+
 def test_specs_text_renders_titles_bodies_and_items():
     specs = [{
         "title": "Add login",

@@ -43,6 +43,10 @@ SPEC = """Turn this approved request into one or more implementation specs.
 APPROVED SUMMARY for issue #<<<NUM>>> (<<<TITLE>>>):
 <<<SUMMARY>>>
 
+FULL DISCUSSION — the issue description and every comment ((bot) lines are
+prior pipeline output; (human) lines are the source of truth):
+<<<DISCUSSION>>>
+
 Repo context is in the current directory (read what you need; do NOT edit code).
 For each spec: a short title, a url-safe slug, a markdown body (context,
 approach, acceptance criteria, test plan), and a list of small, independently
@@ -66,6 +70,10 @@ risky steps, scope creep, untested edge cases, wrong assumptions.
 SPECS:
 <<<SPECS>>>
 
+ORIGINAL DISCUSSION — the issue description and every comment (judge the specs
+against what was actually asked):
+<<<DISCUSSION>>>
+
 End with exactly one json block:
 ```json
 {"verdict": "ok" | "concerns",
@@ -78,6 +86,10 @@ The spec files are in `specs/<<<NUM>>>/`. Read them and the relevant code.
 Implement every work item. Follow the repo's conventions and CLAUDE.md. Write
 or update tests, and run the test/lint commands. Make focused git commits with
 clear messages. DO NOT push and DO NOT open a PR — the orchestrator does that.
+
+CONTEXT — the issue and its full discussion (intent; (bot) lines are prior
+pipeline output, (human) lines are the source of truth):
+<<<DISCUSSION>>>
 
 If you hit a blocker that needs a human decision, stop and explain it.
 
@@ -92,6 +104,9 @@ FIX = """Address this review feedback on issue #<<<NUM>>> in the current branch.
 
 REVIEW FEEDBACK (round <<<ROUND>>>):
 <<<FEEDBACK>>>
+
+CONTEXT — the issue, PR, and full discussion:
+<<<DISCUSSION>>>
 
 Make the changes, update tests, run tests/lint, and commit. Do not push.
 
@@ -113,6 +128,10 @@ SPEC(S):
 
 DIFF:
 <<<DIFF>>>
+
+FULL DISCUSSION — the issue and PR descriptions and every comment (check the
+change against what was actually asked for and discussed):
+<<<DISCUSSION>>>
 
 Check correctness, that acceptance criteria are met, test coverage, and obvious
 bugs/security issues. Approve only if it genuinely satisfies the spec. Use

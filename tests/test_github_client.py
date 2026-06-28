@@ -16,6 +16,14 @@ def test_bot_marker_format():
     assert bot_marker() == "`[norne-orchestrator-na]`"
 
 
+def test_bot_marker_includes_model_and_tokens():
+    # Shows the real model id and the token count of the run that produced it.
+    assert bot_marker("claude-opus-4-8", "high", tokens=12345) == \
+        "`[norne-claude-opus-4-8-high-12345tok]`"
+    # No token suffix for non-metered (orchestrator status) comments.
+    assert "tok" not in bot_marker("claude-opus-4-8", "high")
+
+
 def test_is_bot_comment_detects_marker():
     assert is_bot_comment(_c(1, "Hi\n\n`[norne-glm-5.2-high]`")) is True
     assert is_bot_comment(_c(2, "a plain human reply")) is False
@@ -36,9 +44,9 @@ def test_comment_appends_marker(monkeypatch):
         return FakeResp()
 
     monkeypatch.setattr(gh.s, "post", fake_post)
-    gh.comment(5, "Hello", model="glm-4.7", effort="low")
+    gh.comment(5, "Hello", model="claude-opus-4-8", effort="high", tokens=999)
     assert captured["body"].startswith("Hello")
-    assert captured["body"].rstrip().endswith("`[norne-glm-4.7-low]`")
+    assert captured["body"].rstrip().endswith("`[norne-claude-opus-4-8-high-999tok]`")
     # round-trips: a comment we posted reads back as a bot comment
     assert is_bot_comment({"body": captured["body"]}) is True
 

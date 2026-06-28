@@ -22,6 +22,31 @@ def _model_for(stage, fam):
     return table[stage]
 
 
+def _discussion(gh, n, issue=None, pr_number=None):
+    """The full discussion a stage should weigh: the issue description and every
+    issue comment, plus the PR description and its conversation + inline review
+    comments when a PR exists. Each comment is tagged (human) — the source of
+    truth — or (bot) — prior pipeline output."""
+    def fmt(cs):
+        return "\n".join(
+            f"- ({'bot' if is_bot_comment(c) else 'human'}) {(c.get('body') or '').strip()}"
+            for c in cs)
+
+    iss = issue or gh.get_issue(n)
+    parts = [f"ISSUE #{n}: {iss.get('title', '')}\n{iss.get('body') or '(no description)'}"]
+    issue_comments = gh.list_comments(n)
+    if issue_comments:
+        parts.append("ISSUE COMMENTS (oldest first):\n" + fmt(issue_comments))
+    if pr_number:
+        pr = gh.get_pull(pr_number)
+        parts.append(f"PULL REQUEST #{pr_number}: {pr.get('title', '')}\n"
+                     f"{pr.get('body') or '(no description)'}")
+        pr_comments = gh.list_comments(pr_number) + gh.pull_review_comments(pr_number)
+        if pr_comments:
+            parts.append("PR COMMENTS:\n" + fmt(pr_comments))
+    return "\n\n---\n\n".join(parts)
+
+
 def _specs_text(specs):
     parts = []
     for s in specs:
@@ -76,13 +101,13 @@ def handle_summarize(gh, ledger, issue):
         gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
                       f"If this looks right, add the `{config.SIG_APPROVE}` label to approve "
                       f"— or just comment to ask for changes.",
-                   model=model, effort=effort)
+                   model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_APPROVAL, issue)
     else:
         qs = "\n".join(f"- {q}" for q in d.get("questions", [])) or "- (clarify)"
         gh.comment(n, f"📋 **Summary (draft)**\n\n{d.get('summary','')}\n\n"
                       f"**A few questions before I spec this:**\n{qs}",
-                   model=model, effort=effort)
+                   model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_CLARIFY, issue)
 
 
@@ -102,8 +127,9 @@ def handle_spec(gh, ledger, issue):
     guidance = issue_meta(n).get("human_guidance")
     if guidance:
         summary += f"\n\nHUMAN GUIDANCE:\n{guidance}"
+    discussion = _discussion(gh, n, issue=issue)
     fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
-                    TITLE=issue["title"], SUMMARY=summary), cwd=path)
+                    TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion), cwd=path)
     d = res.data
     if d.get("status") != "ready" or not d.get("specs"):
         _pause(gh, n, d.get("reason") or "Spec generation needs input.")
@@ -111,7 +137,8 @@ def handle_spec(gh, ledger, issue):
     specs = d["specs"]
     # diversity-of-thought: a different family reviews the spec
     _, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                  SPECS=_specs_text(specs)), cwd=path, exclude_family=fam)
+                  SPECS=_specs_text(specs), DISCUSSION=discussion),
+                  cwd=path, exclude_family=fam)
     concerns = rev.data.get("concerns") or []
     if rev.data.get("verdict") == "concerns" and concerns:
         _pause(gh, n, "Spec review raised concerns:\n" +
@@ -139,11 +166,12 @@ def handle_implement(gh, ledger, issue):
     path = repo.ensure_repo(n)
     repo.checkout_branch(path, meta["branch"], gh.default_branch())
     rnd = meta.get("review_round", 0)
+    discussion = _discussion(gh, n, issue=issue, pr_number=meta.get("pr_number"))
     if rnd > 0 and meta.get("last_feedback"):           # fix iteration
         prompt = prompts.render(prompts.FIX, NUM=n, ROUND=rnd,
-                                FEEDBACK=meta["last_feedback"])
+                                FEEDBACK=meta["last_feedback"], DISCUSSION=discussion)
     else:
-        prompt = prompts.render(prompts.IMPLEMENT, NUM=n)
+        prompt = prompts.render(prompts.IMPLEMENT, NUM=n, DISCUSSION=discussion)
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
     if res.data.get("status") != "done":
         _pause(gh, n, res.data.get("reason") or "Implementation hit a blocker.")
@@ -166,17 +194,19 @@ def handle_review(gh, ledger, issue):
     pr = gh.get_pull(meta["pr_number"])
     diff = gh.pull_diff(meta["pr_number"])[:60000]      # keep prompt bounded
     summary = _last_bot_summary(gh, n)
+    discussion = _discussion(gh, n, issue=issue, pr_number=meta["pr_number"])
     prompt = prompts.render(prompts.REVIEW, NUM=n, TITLE=issue["title"],
                             SUMMARY=summary, SPECS=_specs_text(meta.get("specs", [])),
-                            DIFF=diff)
+                            DIFF=diff, DISCUSSION=discussion)
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=repo.workdir(n),
                     exclude_family=meta.get("implementer"))
     model, effort = _model_for("review", fam), config.EFFORT_BY_STAGE["review"]
+    tok = res.input_tokens + res.output_tokens
     status = res.data.get("status")
     if status == "approve":
         gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}",
-                   model=model, effort=effort)
+                   model=model, effort=effort, tokens=tok)
         gh.set_flow(n, config.FLOW_MERGE, issue)
     elif status == "request_changes":
         rnd = meta.get("review_round", 0) + 1
@@ -187,7 +217,7 @@ def handle_review(gh, ledger, issue):
         fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
              res.data.get("summary", "")
         gh.comment(n, f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}",
-                   model=model, effort=effort)
+                   model=model, effort=effort, tokens=tok)
         update_issue_meta(n, review_round=rnd, last_feedback=fb)
         gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
     else:
