@@ -14,7 +14,7 @@ primary_region = "ams"   # set to your nearest Fly region
 
 [env]
   POLL_INTERVAL = "30"          # seconds between GitHub polls
-  GLM_RUNNER = "pi"             # "pi" or "claude-code-zai"
+  GLM_RUNNER = "claude-code-zai"  # guaranteed-headless GLM (Claude Code -> z.ai); no-Claude box
   GLM_TIER = "lite"             # lite | pro | max  (sizes the GLM budget)
   ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
   AUTO_MERGE = "false"          # false = a human clicks merge
