@@ -47,8 +47,12 @@ FULL DISCUSSION — the issue description and every comment ((bot) lines are
 prior pipeline output; (human) lines are the source of truth):
 <<<DISCUSSION>>>
 
-PRIOR DRAFT & PEER-REVIEW FEEDBACK — if present, REVISE your specs to resolve
-every concern below ("(none)" on the first pass):
+PRIOR DRAFT & PEER-REVIEW FEEDBACK ("(none)" on the first pass): for EACH
+concern below, either (a) REVISE your specs to resolve it, or (b) if you
+genuinely disagree — it is wrong, already handled, or out of scope — KEEP your
+approach and say why. Do NOT blindly comply with a concern you believe is
+mistaken; use your judgement. Record a short response to each concern in
+`responses` so the reviewer can weigh it.
 <<<FEEDBACK>>>
 
 Repo context is in the current directory (read what you need; do NOT edit code).
@@ -63,6 +67,7 @@ End with exactly one json block:
 ```json
 {"status": "ready" | "needs_human",
  "reason": "<only if needs_human>",
+ "responses": ["<your reply to each prior concern: 'addressed: ...' or 'disagree: ...'; omit on the first pass>"],
  "specs": [{"title": "...", "slug": "...", "body": "...",
             "work_items": [{"title": "...", "body": "..."}]}]}
 ```"""
@@ -73,6 +78,12 @@ risky steps, scope creep, untested edge cases, wrong assumptions.
 
 SPECS:
 <<<SPECS>>>
+
+THE AUTHOR'S RESPONSES to your previous concerns ("(none)" on the first review)
+— WEIGH these fairly: if a concern is now addressed, or the author gives a sound
+reason it does not apply (it's wrong, already handled, or out of scope), do NOT
+re-raise it. Insist only if the rebuttal is itself wrong, and say why:
+<<<AUTHOR_RESPONSES>>>
 
 ORIGINAL DISCUSSION — the issue description and every comment (judge the specs
 against what was actually asked):

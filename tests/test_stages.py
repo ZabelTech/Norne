@@ -260,13 +260,19 @@ def _spec_env(monkeypatch, seq):
     """Stub handle_spec's deps; meta persists across ticks (cross-tick loop)."""
     it = iter(seq)
     meta = {}
-    monkeypatch.setattr(stages, "_run", lambda *a, **k: next(it))
+    runs = []
+
+    def fake_run(stage, ledger, prompt, cwd=None, **k):
+        runs.append((stage, prompt))
+        return next(it)
+
+    monkeypatch.setattr(stages, "_run", fake_run)
     monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
     monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
     monkeypatch.setattr(stages, "issue_meta", lambda n: dict(meta))
     monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: meta.update(kw))
-    out = {"meta": meta}
+    out = {"meta": meta, "runs": runs}
     monkeypatch.setattr(stages, "_publish_specs",
                         lambda gh, n, path, specs, round_note="":
                         out.update(published=specs, note=round_note))
@@ -334,6 +340,17 @@ def test_spec_author_judgement_call_escalates(monkeypatch):
     _tick()
     assert out["escalated"][1] == "ambiguous"
     assert "author stopped before review" in out["note"]
+
+
+def test_spec_carries_author_rebuttals_into_the_review_prompt(monkeypatch):
+    out = _spec_env(monkeypatch, [
+        ("claude", _R({"status": "ready", "specs": [{"title": "A"}],
+                       "responses": ["disagree: concern X is wrong because Z"]})),
+        ("glm", _R({"verdict": "ok", "concerns": []})),
+    ])
+    _tick()
+    review_prompt = next(p for (s, p) in out["runs"] if s == "review")
+    assert "disagree: concern X is wrong because Z" in review_prompt   # reviewer sees it
 
 
 def test_spec_parse_failure_surfaces_the_agents_message(monkeypatch):

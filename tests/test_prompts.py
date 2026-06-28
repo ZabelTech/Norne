@@ -77,6 +77,17 @@ def test_spec_template_has_feedback_slot_for_the_loop():
     assert "<<<" not in out
 
 
+def test_spec_template_has_a_responses_field_for_rebuttals():
+    assert '"responses"' in prompts.SPEC
+
+
+def test_spec_review_weighs_author_responses():
+    assert "<<<AUTHOR_RESPONSES>>>" in prompts.SPEC_REVIEW
+    out = prompts.render(prompts.SPEC_REVIEW, SPECS="S",
+                         AUTHOR_RESPONSES="RTEXT", DISCUSSION="D")
+    assert "RTEXT" in out and "<<<" not in out
+
+
 def test_every_stage_template_ends_with_a_json_contract():
     for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
                 prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):

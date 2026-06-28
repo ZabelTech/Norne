@@ -206,9 +206,14 @@ def handle_spec(gh, ledger, issue):
                        round_note=f"🔎 Spec round {rnd} — author {author} ({why}).")
         return
     specs = d["specs"]
-    # diversity-of-thought: a DIFFERENT family peer-reviews the specs
+    # the author's replies to last round's concerns (resolved or rebutted)
+    responses = "\n".join(f"- {r}" for r in (d.get("responses") or [])) \
+        or "(none — first review)"
+    # diversity-of-thought: a DIFFERENT family peer-reviews the specs, weighing
+    # the author's responses so a sound rebuttal isn't re-raised.
     rfam, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                     SPECS=_specs_text(specs), DISCUSSION=discussion),
+                     SPECS=_specs_text(specs), AUTHOR_RESPONSES=responses,
+                     DISCUSSION=discussion),
                      cwd=path, exclude_family=fam)
     reviewer = _participant("review", rfam, rev)
     note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
