@@ -67,6 +67,24 @@ def test_glm_model_map_covers_every_stage():
     assert set(config.GLM_MODEL_BY_STAGE) == set(config.ROUTING)
 
 
+def test_family_available_tracks_credential_presence(monkeypatch):
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")
+    assert config.family_available("claude") is True
+    assert config.family_available("glm") is True
+
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    assert config.family_available("claude") is False
+    assert config.family_available("glm") is True  # GLM still configured
+
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "")
+    assert config.family_available("glm") is False
+
+
+def test_family_available_unknown_family_is_false():
+    assert config.family_available("gpt") is False
+
+
 def test_glm_tier_limits_have_all_tiers():
     for tier in ("lite", "pro", "max"):
         lim = config.GLM_TIER_LIMITS[tier]

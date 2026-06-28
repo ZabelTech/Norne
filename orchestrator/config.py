@@ -85,3 +85,18 @@ GLM_MODEL_BY_STAGE = {
     "implement": "glm-4.7",
     "review":    "glm-5.2",
 }
+
+
+def family_available(family):
+    """True if `family` has the credential it needs to run at all.
+
+    The router consults this so a *single-family* deployment routes correctly
+    instead of selecting a family whose token is absent and then failing at
+    call time. Leaving CLAUDE_CODE_OAUTH_TOKEN unset therefore yields a clean
+    GLM-only ("no-Claude") deployment with no ROUTING changes required.
+    """
+    if family == "claude":
+        return bool(CLAUDE_CODE_OAUTH_TOKEN)
+    if family == "glm":
+        return bool(ZAI_AUTH_TOKEN)
+    return False

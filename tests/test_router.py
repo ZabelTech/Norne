@@ -50,3 +50,37 @@ def test_exclude_family_does_not_block_unrelated_choice():
     led = FakeLedger({"claude": True, "glm": True})
     # Excluding glm from a claude-first stage still yields claude.
     assert router.choose_family("spec", led, exclude_family="glm") == "claude"
+
+
+# ── single-family ("no-Claude" / GLM-only) deployment ───────────────────────
+def test_unconfigured_family_is_skipped(monkeypatch):
+    # No Claude token -> Claude is never eligible even with budget headroom;
+    # every stage falls through to GLM.
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    led = FakeLedger({"claude": True, "glm": True})
+    assert router.choose_family("summarize", led) == "glm"
+    assert router.choose_family("spec", led) == "glm"
+    assert router.choose_family("implement", led) == "glm"
+
+
+def test_review_degrades_to_same_family_when_only_one_configured(monkeypatch):
+    # Claude-less box: GLM implemented, so review would exclude GLM and find no
+    # other configured family. Rather than deadlock, allow a same-family review.
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    led = FakeLedger({"claude": True, "glm": True})
+    assert router.choose_family("review", led, exclude_family="glm") == "glm"
+
+
+def test_review_does_not_degrade_when_other_family_only_lacks_budget():
+    # Both families configured but the partner is out of budget -> we must NOT
+    # silently fall back to same-family review; park as blocked:budget instead.
+    led = FakeLedger({"claude": False, "glm": True})
+    assert router.choose_family("review", led, exclude_family="glm") is None
+
+
+def test_no_family_configured_returns_none(monkeypatch):
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "")
+    led = FakeLedger({"claude": True, "glm": True})
+    assert router.choose_family("spec", led) is None
+    assert router.choose_family("review", led, exclude_family="glm") is None

@@ -15,6 +15,10 @@ _TEST_DATA_DIR = tempfile.mkdtemp(prefix="norne-tests-")
 os.environ.setdefault("GH_TOKEN", "test-token")
 os.environ.setdefault("GH_REPO", "owner/repo")
 os.environ.setdefault("BOT_LOGIN", "pipeline-bot")
+# Both model families configured by default, so routing treats each as
+# available (see config.family_available); Claude-less tests clear the token.
+os.environ.setdefault("CLAUDE_CODE_OAUTH_TOKEN", "test-claude-oauth")
+os.environ.setdefault("ZAI_AUTH_TOKEN", "test-zai-token")
 os.environ.setdefault("DATA_DIR", _TEST_DATA_DIR)
 os.environ.setdefault("WORKDIR_ROOT", os.path.join(_TEST_DATA_DIR, "work"))
 # Deterministic budget/tier knobs so the ledger tests assert against known numbers.
