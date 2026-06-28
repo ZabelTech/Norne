@@ -99,6 +99,25 @@ EFFORT_BY_STAGE = {
     "review":    "high",
 }
 
+# What an effort label actually DOES to a run: a reasoning directive prepended
+# to the prompt (the "think"/"think hard" keywords trigger Claude Code's
+# extended thinking, and read as plain instructions for GLM via z.ai) plus a
+# max-turns budget (more turns = more room to investigate before answering).
+EFFORT_TUNING = {
+    "low":    {"directive": "",
+               "max_turns": 25},
+    "medium": {"directive": "Think it through before you answer.",
+               "max_turns": 40},
+    "high":   {"directive": "Think hard. Investigate thoroughly and reason "
+                            "step by step before you answer.",
+               "max_turns": 60},
+}
+
+
+def effort_tuning(effort):
+    """Resolve an effort label to its {directive, max_turns}, defaulting to medium."""
+    return EFFORT_TUNING.get(effort, EFFORT_TUNING["medium"])
+
 
 def family_available(family):
     """True if `family` has the credential it needs to run at all.

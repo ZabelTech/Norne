@@ -72,6 +72,22 @@ def test_effort_map_covers_every_stage():
     assert set(config.EFFORT_BY_STAGE) == set(config.ROUTING)
 
 
+def test_every_stage_effort_is_tunable():
+    # Each effort label used by a stage must resolve to a real tuning entry.
+    for effort in config.EFFORT_BY_STAGE.values():
+        assert effort in config.EFFORT_TUNING
+
+
+def test_effort_tuning_entries_well_formed():
+    for label, t in config.EFFORT_TUNING.items():
+        assert "directive" in t and "max_turns" in t
+        assert isinstance(t["max_turns"], int) and t["max_turns"] > 0
+
+
+def test_effort_tuning_defaults_to_medium_on_unknown():
+    assert config.effort_tuning("nope") is config.EFFORT_TUNING["medium"]
+
+
 def test_family_available_tracks_credential_presence(monkeypatch):
     monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
     monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")

@@ -43,7 +43,8 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
         raise BudgetParked()
     runner = runners.get_runner(fam)
     model = config.GLM_MODEL_BY_STAGE[stage] if fam == "glm" else None
-    res = runner.run(prompt, cwd=cwd, write=write, model=model)
+    res = runner.run(prompt, cwd=cwd, write=write, model=model,
+                     effort=config.EFFORT_BY_STAGE[stage])
     _record(ledger, fam, res)
     return fam, res
 

@@ -65,8 +65,9 @@ class StubRunner:
         self._result = result
         self.seen = {}
 
-    def run(self, prompt, cwd, write=False, model=None):
-        self.seen = {"prompt": prompt, "cwd": cwd, "write": write, "model": model}
+    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+        self.seen = {"prompt": prompt, "cwd": cwd, "write": write,
+                     "model": model, "effort": effort}
         return self._result
 
 
@@ -97,6 +98,16 @@ def test_run_passes_glm_model_for_glm_family(monkeypatch):
     stages._run("implement", led, "P", cwd="/w", write=True)
     assert runner.seen["model"] == config.GLM_MODEL_BY_STAGE["implement"]
     assert runner.seen["write"] is True
+
+
+def test_run_passes_stage_effort_to_runner(monkeypatch):
+    led = RecordingLedger()
+    runner = StubRunner("glm", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "glm")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    stages._run("summarize", led, "P", cwd="/w")
+    assert runner.seen["effort"] == config.EFFORT_BY_STAGE["summarize"]  # "high"
 
 
 def test_run_raises_budget_parked_when_no_family(monkeypatch):

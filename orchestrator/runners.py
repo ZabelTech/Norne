@@ -73,6 +73,18 @@ def _base_env():
     return env
 
 
+def _apply_effort(prompt, effort):
+    """Prepend the effort directive and return (prompt, max_turns).
+
+    Prepended (not appended) so the prompt's trailing 'end with one json block'
+    instruction stays last.
+    """
+    t = config.effort_tuning(effort)
+    if t["directive"]:
+        prompt = f"{t['directive']}\n\n{prompt}"
+    return prompt, t["max_turns"]
+
+
 def _claude_cc_json(stdout):
     """Parse `claude -p --output-format json` -> (final_text, in_tok, out_tok)."""
     text, itok, otok = "", 0, 0
@@ -90,13 +102,14 @@ def _claude_cc_json(stdout):
 class ClaudeCodeRunner:
     family = "claude"
 
-    def run(self, prompt, cwd, write=False, model=None):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
         env = _base_env()
         env["CLAUDE_CODE_OAUTH_TOKEN"] = config.CLAUDE_CODE_OAUTH_TOKEN
         env.pop("ANTHROPIC_BASE_URL", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        prompt, max_turns = _apply_effort(prompt, effort)
         cmd = ["claude", "-p", prompt, "--output-format", "json",
-               "--permission-mode", "bypassPermissions", "--max-turns", "40"]
+               "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns)]
         if model:
             cmd += ["--model", model]
         res, blob = _run(cmd, cwd, env, "claude")
@@ -109,14 +122,15 @@ class GlmClaudeCodeRunner:
     """GLM via Claude Code pointed at z.ai (Anthropic-compatible endpoint)."""
     family = "glm"
 
-    def run(self, prompt, cwd, write=False, model="glm-4.7"):
+    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium"):
         env = _base_env()
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)          # use z.ai, not Anthropic
         env["ANTHROPIC_BASE_URL"] = config.ZAI_BASE_URL
         env["ANTHROPIC_AUTH_TOKEN"] = config.ZAI_AUTH_TOKEN
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        prompt, max_turns = _apply_effort(prompt, effort)
         cmd = ["claude", "-p", prompt, "--output-format", "json",
-               "--permission-mode", "bypassPermissions", "--max-turns", "40",
+               "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns),
                "--model", model]
         res, blob = _run(cmd, cwd, env, "glm")
         text, itok, otok = _claude_cc_json(res.stdout)
@@ -135,9 +149,10 @@ class GlmPiRunner:
     """
     family = "glm"
 
-    def run(self, prompt, cwd, write=False, model="glm-4.7"):
+    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium"):
         env = _base_env()
         env["PI_MODEL"] = model
+        prompt, _ = _apply_effort(prompt, effort)   # Pi has no max-turns flag here
         # Best-effort non-interactive invocation; verify against your Pi version.
         cmd = ["pi", "--print", "--model", model, prompt]
         res, blob = _run(cmd, cwd, env, "glm")

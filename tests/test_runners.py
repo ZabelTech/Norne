@@ -115,3 +115,24 @@ def test_base_env_preserves_other_vars(monkeypatch):
 def test_get_runner_returns_matching_family():
     assert runners.get_runner("claude").family == "claude"
     assert runners.get_runner("glm").family == "glm"
+
+
+# ── effort wiring ────────────────────────────────────────────────────────────
+def test_apply_effort_high_prepends_directive_and_raises_turns():
+    from orchestrator import config
+    prompt, max_turns = runners._apply_effort("DO THE THING", "high")
+    assert prompt.endswith("DO THE THING")          # directive prepended, prompt last
+    assert prompt != "DO THE THING"                  # something was prepended
+    assert max_turns == config.EFFORT_TUNING["high"]["max_turns"]
+
+
+def test_apply_effort_low_adds_no_directive():
+    prompt, max_turns = runners._apply_effort("PROMPT", "low")
+    assert prompt == "PROMPT"                         # low has an empty directive
+    assert max_turns == 25
+
+
+def test_apply_effort_unknown_effort_defaults_to_medium():
+    _, max_turns = runners._apply_effort("P", "bogus")
+    from orchestrator import config
+    assert max_turns == config.EFFORT_TUNING["medium"]["max_turns"]
