@@ -52,11 +52,13 @@ def test_fix_template_includes_round_and_feedback():
     assert "<<<" not in out
 
 
-def test_review_template_carries_diff_specs_and_discussion():
+def test_review_template_carries_specs_branches_and_discussion():
     out = prompts.render(prompts.REVIEW, NUM=9, TITLE="T", SUMMARY="S",
-                         SPECS="SPECTEXT", DIFF="DIFFTEXT", DISCUSSION="DISCTEXT")
+                         SPECS="SPECTEXT", BRANCH="pipeline/issue-9", BASE="main",
+                         DISCUSSION="DISCTEXT")
     assert "SPECTEXT" in out
-    assert "DIFFTEXT" in out
+    assert "pipeline/issue-9" in out                 # PR branch named
+    assert "git diff main...pipeline/issue-9" in out  # self-diff instruction wired
     assert "DISCTEXT" in out
     assert "<<<" not in out
 

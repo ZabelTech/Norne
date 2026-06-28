@@ -126,12 +126,15 @@ ORIGINAL ISSUE #<<<NUM>>>: <<<TITLE>>>
 SPEC(S):
 <<<SPECS>>>
 
-DIFF:
-<<<DIFF>>>
-
 FULL DISCUSSION — the issue and PR descriptions and every comment (check the
 change against what was actually asked for and discussed):
 <<<DISCUSSION>>>
+
+The PR branch `<<<BRANCH>>>` is checked out in the current directory and the
+target branch is `<<<BASE>>>`. Inspect the change YOURSELF with git: run
+`git diff <<<BASE>>>...<<<BRANCH>>>` to see the complete set of changes, then
+open whatever files you need for context. Review ALL changed files end to end —
+every hunk, not a sample — and run the tests if it helps you judge correctness.
 
 Check correctness, that acceptance criteria are met, test coverage, and obvious
 bugs/security issues. Approve only if it genuinely satisfies the spec. Use

@@ -191,15 +191,19 @@ def handle_implement(gh, ledger, issue):
 def handle_review(gh, ledger, issue):
     n = issue["number"]
     meta = issue_meta(n)
-    pr = gh.get_pull(meta["pr_number"])
-    diff = gh.pull_diff(meta["pr_number"])              # full diff; review sees everything
+    base = gh.default_branch()
+    branch = meta["branch"]
+    # Check the PR branch out (base fetched + pulled too) so the reviewer can run
+    # git diff itself against the target branch and inspect the whole tree.
+    path = repo.ensure_repo(n)
+    repo.checkout_branch(path, branch, base)
     summary = _last_bot_summary(gh, n)
     discussion = _discussion(gh, n, issue=issue, pr_number=meta["pr_number"])
     prompt = prompts.render(prompts.REVIEW, NUM=n, TITLE=issue["title"],
                             SUMMARY=summary, SPECS=_specs_text(meta.get("specs", [])),
-                            DIFF=diff, DISCUSSION=discussion)
+                            BRANCH=branch, BASE=base, DISCUSSION=discussion)
     # cross-check: review with the OTHER family than implemented
-    fam, res = _run("review", ledger, prompt, cwd=repo.workdir(n),
+    fam, res = _run("review", ledger, prompt, cwd=path,
                     exclude_family=meta.get("implementer"))
     model, effort = _model_for("review", fam), config.EFFORT_BY_STAGE["review"]
     tok = res.input_tokens + res.output_tokens
