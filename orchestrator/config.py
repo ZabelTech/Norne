@@ -9,7 +9,9 @@ def _b(name, default="false"):
 # ── Connection ────────────────────────────────────────────────────────────
 GH_TOKEN = os.environ["GH_TOKEN"]
 GH_REPO = os.environ["GH_REPO"]                       # "owner/repo"
-BOT_LOGIN = os.environ.get("BOT_LOGIN", "").lower()    # to tell human comments from ours
+BOT_LOGIN = os.environ.get("BOT_LOGIN", "").lower()    # informational; NOT the identity
+# signal anymore — bot comments are tagged with a marker (see github_client), so the
+# pipeline works even when it posts under a human's own token (shared identity).
 
 CLAUDE_CODE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 ZAI_AUTH_TOKEN = os.environ.get("ZAI_AUTH_TOKEN", "")
@@ -84,6 +86,17 @@ GLM_MODEL_BY_STAGE = {
     "spec":      "glm-5.2",
     "implement": "glm-4.7",
     "review":    "glm-5.2",
+}
+
+# Reasoning-effort label per stage. Carried in the bot-comment marker
+# [norne-{model}-{effort}] for traceability — light stages stay cheap, the
+# reasoning-heavy spec/review stages run hot. (Metadata today; ready to wire to
+# a real per-call effort knob if the runners gain one.)
+EFFORT_BY_STAGE = {
+    "summarize": "low",
+    "spec":      "high",
+    "implement": "medium",
+    "review":    "high",
 }
 
 

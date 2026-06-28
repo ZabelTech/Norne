@@ -1,8 +1,26 @@
 """Thin GitHub REST client (stdlib + requests). Only what the pipeline needs."""
+import re
+
 import requests
 from . import config
 
 API = "https://api.github.com"
+
+# Every comment the bot posts is tagged with this marker so it can recognise its
+# OWN comments — independent of which account/token posted them. This is what
+# lets the clarify loop tell a human reply from its own draft even when the bot
+# authenticates with the repo owner's personal token (shared identity).
+_BOT_MARKER = re.compile(r"\[norne-[^\]]*\]")
+
+
+def bot_marker(model="orchestrator", effort="na"):
+    """The trailing tag stamped on bot comments: `[norne-{model}-{effort}]`."""
+    return f"`[norne-{model}-{effort}]`"
+
+
+def is_bot_comment(comment):
+    """True if this comment carries the bot marker (i.e. the pipeline wrote it)."""
+    return bool(_BOT_MARKER.search(comment.get("body") or ""))
 
 
 class GitHub:
@@ -66,7 +84,9 @@ class GitHub:
         if flow_label not in current:
             self.add_labels(n, [flow_label])
 
-    def comment(self, n, body):
+    def comment(self, n, body, model="orchestrator", effort="na"):
+        """Post a comment, tagged with the bot marker so we can recognise our own."""
+        body = f"{body}\n\n{bot_marker(model, effort)}"
         self.s.post(self._u(f"/issues/{n}/comments"),
                     json={"body": body}).raise_for_status()
 
@@ -74,10 +94,13 @@ class GitHub:
         return self._get(f"/issues/{n}/comments", params={"per_page": 100})
 
     def latest_human_comment(self, n):
-        """Most recent comment NOT authored by the bot. None if last word was ours."""
+        """Most recent comment NOT written by the bot. None if last word was ours.
+
+        Identifies the bot by its comment marker (see is_bot_comment), so this
+        is correct even when the bot posts under the same account as the human."""
         best = None
         for c in self.list_comments(n):
-            if c["user"]["login"].lower() == config.BOT_LOGIN:
+            if is_bot_comment(c):
                 continue
             if best is None or c["id"] > best["id"]:
                 best = c

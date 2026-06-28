@@ -7,12 +7,18 @@ implementer family, paused guidance) lives in store.issue_meta.
 """
 import math
 from . import config, prompts, repo, runners, router
+from .github_client import is_bot_comment
 from .runners import RateLimited
 from .store import issue_meta, update_issue_meta
 
 
 class BudgetParked(Exception):
     """No pool has headroom for this stage right now."""
+
+
+def _model_label(stage, fam):
+    """The model name for a stage's bot-comment marker."""
+    return config.GLM_MODEL_BY_STAGE[stage] if fam == "glm" else "claude"
 
 
 def _specs_text(specs):
@@ -54,20 +60,23 @@ def handle_summarize(gh, ledger, issue):
     n = issue["number"]
     comments = gh.list_comments(n)
     human = "\n---\n".join(c["body"] for c in comments
-                           if c["user"]["login"].lower() != config.BOT_LOGIN) or "(none)"
+                           if not is_bot_comment(c)) or "(none)"
     prompt = prompts.render(prompts.SUMMARIZE, NUM=n, TITLE=issue["title"],
                             BODY=issue.get("body") or "(no description)",
                             CLARIFICATIONS=human)
-    _, res = _run("summarize", ledger, prompt, cwd=config.DATA_DIR)
+    fam, res = _run("summarize", ledger, prompt, cwd=config.DATA_DIR)
+    model, effort = _model_label("summarize", fam), config.EFFORT_BY_STAGE["summarize"]
     d = res.data
     if d.get("status") == "ready":
         gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
-                      f"If this looks right, add the `{config.SIG_APPROVE}` label to approve.")
+                      f"If this looks right, add the `{config.SIG_APPROVE}` label to approve.",
+                   model=model, effort=effort)
         gh.set_flow(n, config.FLOW_APPROVAL, issue)
     else:
         qs = "\n".join(f"- {q}" for q in d.get("questions", [])) or "- (clarify)"
         gh.comment(n, f"📋 **Summary (draft)**\n\n{d.get('summary','')}\n\n"
-                      f"**A few questions before I spec this:**\n{qs}")
+                      f"**A few questions before I spec this:**\n{qs}",
+                   model=model, effort=effort)
         last = max((c["id"] for c in comments), default=0)
         update_issue_meta(n, last_comment_seen=last)
         gh.set_flow(n, config.FLOW_CLARIFY, issue)
@@ -159,9 +168,11 @@ def handle_review(gh, ledger, issue):
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=repo.workdir(n),
                     exclude_family=meta.get("implementer"))
+    model, effort = _model_label("review", fam), config.EFFORT_BY_STAGE["review"]
     status = res.data.get("status")
     if status == "approve":
-        gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}")
+        gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}",
+                   model=model, effort=effort)
         gh.set_flow(n, config.FLOW_MERGE, issue)
     elif status == "request_changes":
         rnd = meta.get("review_round", 0) + 1
@@ -171,7 +182,8 @@ def handle_review(gh, ledger, issue):
             return
         fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
              res.data.get("summary", "")
-        gh.comment(n, f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}")
+        gh.comment(n, f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}",
+                   model=model, effort=effort)
         update_issue_meta(n, review_round=rnd, last_feedback=fb)
         gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
     else:
@@ -195,7 +207,7 @@ def handle_merge(gh, ledger, issue):
 # ── helpers ────────────────────────────────────────────────────────────────
 def _last_bot_summary(gh, n):
     for c in reversed(gh.list_comments(n)):
-        if c["user"]["login"].lower() == config.BOT_LOGIN and "Summary" in c["body"]:
+        if is_bot_comment(c) and "Summary" in c["body"]:
             return c["body"]
     return "(summary unavailable)"
 

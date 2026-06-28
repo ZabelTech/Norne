@@ -67,6 +67,11 @@ def test_glm_model_map_covers_every_stage():
     assert set(config.GLM_MODEL_BY_STAGE) == set(config.ROUTING)
 
 
+def test_effort_map_covers_every_stage():
+    # Every routed stage needs an effort label for its bot-comment marker.
+    assert set(config.EFFORT_BY_STAGE) == set(config.ROUTING)
+
+
 def test_family_available_tracks_credential_presence(monkeypatch):
     monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
     monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")
