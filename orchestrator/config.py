@@ -88,6 +88,17 @@ GLM_MODEL_BY_STAGE = {
     "review":    "glm-5.2",
 }
 
+# Which Claude model per stage (Opus 4.8 = best, Sonnet 4.6 = balanced). Mirrors
+# the GLM split: the best model for the heavy reasoning stages — spec and review
+# — and the balanced one for the front-door loop (summarize) and bulk/failover
+# implement. review uses the BEST model on purpose (see _model_for / router).
+CLAUDE_MODEL_BY_STAGE = {
+    "summarize": "claude-sonnet-4-6",
+    "spec":      "claude-opus-4-8",
+    "implement": "claude-sonnet-4-6",
+    "review":    "claude-opus-4-8",
+}
+
 # Reasoning-effort label per stage. Carried in the bot-comment marker
 # [norne-{model}-{effort}] for traceability — light stages stay cheap, the
 # reasoning-heavy spec/review stages run hot. (Metadata today; ready to wire to

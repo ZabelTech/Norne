@@ -25,20 +25,19 @@ def _eligible(family, ledger):
 
 def choose_family(stage, ledger, exclude_family=None):
     families = config.ROUTING[stage]
+    # Prefer a family OTHER than the excluded (implementer) one — the
+    # diversity-of-thought cross-check.
     for fam in families:
         if exclude_family and fam == exclude_family:
             continue
         if _eligible(fam, ledger):
             return fam
-    # No *different* family was eligible. If that's only because no other family
-    # is configured at all (single-family deploy), the diversity cross-check
-    # cannot be satisfied -- degrade to a same-family review instead of
-    # deadlocking. A different family that is merely out of budget does NOT
-    # trigger this: we return None so the issue parks until a window resets.
-    if exclude_family:
-        other_configured = any(
-            config.family_available(fam) for fam in families if fam != exclude_family
-        )
-        if not other_configured and _eligible(exclude_family, ledger):
-            return exclude_family
+    # No *different* family is eligible — whether because no other family is
+    # configured (single-family deploy) OR the other family is out of budget.
+    # Rather than park the issue, allow a same-family review with the excluded
+    # family if it can still run. The review stage always uses that family's
+    # BEST model + high effort, so a self-review is still a solid check; a true
+    # cross-family review resumes automatically once the other window resets.
+    if exclude_family and _eligible(exclude_family, ledger):
+        return exclude_family
     return None

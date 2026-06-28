@@ -16,9 +16,10 @@ class BudgetParked(Exception):
     """No pool has headroom for this stage right now."""
 
 
-def _model_label(stage, fam):
-    """The model name for a stage's bot-comment marker."""
-    return config.GLM_MODEL_BY_STAGE[stage] if fam == "glm" else "claude"
+def _model_for(stage, fam):
+    """The model id for this stage+family — used both for the run and the marker."""
+    table = config.GLM_MODEL_BY_STAGE if fam == "glm" else config.CLAUDE_MODEL_BY_STAGE
+    return table[stage]
 
 
 def _specs_text(specs):
@@ -42,8 +43,7 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
     if fam is None:
         raise BudgetParked()
     runner = runners.get_runner(fam)
-    model = config.GLM_MODEL_BY_STAGE[stage] if fam == "glm" else None
-    res = runner.run(prompt, cwd=cwd, write=write, model=model,
+    res = runner.run(prompt, cwd=cwd, write=write, model=_model_for(stage, fam),
                      effort=config.EFFORT_BY_STAGE[stage])
     _record(ledger, fam, res)
     return fam, res
@@ -70,7 +70,7 @@ def handle_summarize(gh, ledger, issue):
                             CLARIFICATIONS=human)
     # Run inside a checkout so the model can investigate the repo, not just /data.
     fam, res = _run("summarize", ledger, prompt, cwd=repo.ensure_repo(n))
-    model, effort = _model_label("summarize", fam), config.EFFORT_BY_STAGE["summarize"]
+    model, effort = _model_for("summarize", fam), config.EFFORT_BY_STAGE["summarize"]
     d = res.data
     if d.get("status") == "ready":
         gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
@@ -172,7 +172,7 @@ def handle_review(gh, ledger, issue):
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=repo.workdir(n),
                     exclude_family=meta.get("implementer"))
-    model, effort = _model_label("review", fam), config.EFFORT_BY_STAGE["review"]
+    model, effort = _model_for("review", fam), config.EFFORT_BY_STAGE["review"]
     status = res.data.get("status")
     if status == "approve":
         gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}",

@@ -67,6 +67,21 @@ def test_glm_model_map_covers_every_stage():
     assert set(config.GLM_MODEL_BY_STAGE) == set(config.ROUTING)
 
 
+def test_claude_model_map_covers_every_stage():
+    assert set(config.CLAUDE_MODEL_BY_STAGE) == set(config.ROUTING)
+
+
+def test_review_uses_each_familys_best_model():
+    # Review must always run the strongest model of whichever family does it
+    # (incl. a budget-forced same-family review).
+    assert config.CLAUDE_MODEL_BY_STAGE["review"] == "claude-opus-4-8"
+    assert config.GLM_MODEL_BY_STAGE["review"] == "glm-5.2"
+
+
+def test_review_runs_high_effort():
+    assert config.EFFORT_BY_STAGE["review"] == "high"
+
+
 def test_effort_map_covers_every_stage():
     # Every routed stage needs an effort label for its bot-comment marker.
     assert set(config.EFFORT_BY_STAGE) == set(config.ROUTING)

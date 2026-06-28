@@ -83,8 +83,8 @@ def test_run_routes_records_and_returns_family(monkeypatch):
     assert res is result
     assert runner.seen["prompt"] == "PROMPT"
     assert runner.seen["cwd"] == "/work"
-    # claude stage runs with no GLM model override
-    assert runner.seen["model"] is None
+    # claude stage runs with its pinned per-stage Claude model
+    assert runner.seen["model"] == config.CLAUDE_MODEL_BY_STAGE["spec"]
     # and the call was metered against the claude pool
     assert led.calls == [("claude", 15, 0)]
 

@@ -40,10 +40,11 @@ def test_exclude_family_enforces_a_different_reviewer():
     assert router.choose_family("review", led, exclude_family="glm") == "claude"
 
 
-def test_exclude_family_returns_none_if_only_excluded_has_headroom():
-    # The implementer's family is the only one with budget -> cannot cross-check.
+def test_exclude_family_degrades_to_self_when_only_excluded_has_headroom():
+    # Softened rule: implementer's family is the only one with budget -> rather
+    # than park, let it review itself (still best model + high effort).
     led = FakeLedger({"claude": True, "glm": False})
-    assert router.choose_family("review", led, exclude_family="claude") is None
+    assert router.choose_family("review", led, exclude_family="claude") == "claude"
 
 
 def test_exclude_family_does_not_block_unrelated_choice():
@@ -71,10 +72,16 @@ def test_review_degrades_to_same_family_when_only_one_configured(monkeypatch):
     assert router.choose_family("review", led, exclude_family="glm") == "glm"
 
 
-def test_review_does_not_degrade_when_other_family_only_lacks_budget():
-    # Both families configured but the partner is out of budget -> we must NOT
-    # silently fall back to same-family review; park as blocked:budget instead.
+def test_review_degrades_to_same_family_when_partner_out_of_budget():
+    # Softened rule: if the partner family is merely out of budget, allow the
+    # implementer's family to review itself rather than parking the issue.
     led = FakeLedger({"claude": False, "glm": True})
+    assert router.choose_family("review", led, exclude_family="glm") == "glm"
+
+
+def test_review_parks_only_when_nobody_has_budget():
+    # Same-family fallback still needs the excluded family to have headroom.
+    led = FakeLedger({"claude": False, "glm": False})
     assert router.choose_family("review", led, exclude_family="glm") is None
 
 
