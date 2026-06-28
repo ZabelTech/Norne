@@ -49,13 +49,18 @@ def process_issue(gh, ledger, issue):
     if flow == config.FLOW_DONE:
         return
 
-    # Approval gate ("approval via status change"): you add the `approve` label.
+    # Approval gate. Add the `approve` label to proceed to spec; OR just comment
+    # to ask for changes — a new human comment sends it back to summarize so the
+    # feedback is folded into a revised summary.
     if flow == config.FLOW_APPROVAL:
         if config.SIG_APPROVE in labels:
             gh.remove_label(n, config.SIG_APPROVE)
             gh.set_flow(n, config.FLOW_SPEC)
             flow = config.FLOW_SPEC
         else:
+            latest = gh.latest_human_comment(n)
+            if latest and latest["id"] > issue_meta(n).get("last_comment_seen", 0):
+                gh.set_flow(n, config.FLOW_SUMMARIZE, issue)
             return
 
     handler = DISPATCH.get(flow)

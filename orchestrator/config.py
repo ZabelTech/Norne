@@ -82,7 +82,7 @@ ROUTING = {
 
 # Which GLM model to use per stage (cheap vs flagship) to stretch z.ai quota.
 GLM_MODEL_BY_STAGE = {
-    "summarize": "glm-4.7",
+    "summarize": "glm-5.2",   # front-door understanding gates everything -> flagship
     "spec":      "glm-5.2",
     "implement": "glm-4.7",
     "review":    "glm-5.2",
@@ -93,7 +93,7 @@ GLM_MODEL_BY_STAGE = {
 # reasoning-heavy spec/review stages run hot. (Metadata today; ready to wire to
 # a real per-call effort knob if the runners gain one.)
 EFFORT_BY_STAGE = {
-    "summarize": "low",
+    "summarize": "high",   # research + clarify + summarize is reasoning-heavy
     "spec":      "high",
     "implement": "medium",
     "review":    "high",

@@ -61,15 +61,20 @@ def handle_summarize(gh, ledger, issue):
     comments = gh.list_comments(n)
     human = "\n---\n".join(c["body"] for c in comments
                            if not is_bot_comment(c)) or "(none)"
+    # Mark every comment seen so far as acted-on, so a NEW human comment later —
+    # at the clarify OR the approval gate — is detected as fresh input to revise.
+    update_issue_meta(n, last_comment_seen=max((c["id"] for c in comments), default=0))
     prompt = prompts.render(prompts.SUMMARIZE, NUM=n, TITLE=issue["title"],
                             BODY=issue.get("body") or "(no description)",
                             CLARIFICATIONS=human)
-    fam, res = _run("summarize", ledger, prompt, cwd=config.DATA_DIR)
+    # Run inside a checkout so the model can investigate the repo, not just /data.
+    fam, res = _run("summarize", ledger, prompt, cwd=repo.ensure_repo(n))
     model, effort = _model_label("summarize", fam), config.EFFORT_BY_STAGE["summarize"]
     d = res.data
     if d.get("status") == "ready":
         gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
-                      f"If this looks right, add the `{config.SIG_APPROVE}` label to approve.",
+                      f"If this looks right, add the `{config.SIG_APPROVE}` label to approve "
+                      f"— or just comment to ask for changes.",
                    model=model, effort=effort)
         gh.set_flow(n, config.FLOW_APPROVAL, issue)
     else:
@@ -77,8 +82,6 @@ def handle_summarize(gh, ledger, issue):
         gh.comment(n, f"📋 **Summary (draft)**\n\n{d.get('summary','')}\n\n"
                       f"**A few questions before I spec this:**\n{qs}",
                    model=model, effort=effort)
-        last = max((c["id"] for c in comments), default=0)
-        update_issue_meta(n, last_comment_seen=last)
         gh.set_flow(n, config.FLOW_CLARIFY, issue)
 
 

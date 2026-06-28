@@ -13,7 +13,11 @@ def render(tpl, **kw):
     return out
 
 
-SUMMARIZE = """You are triaging a GitHub issue for an automated build pipeline.
+SUMMARIZE = """You are triaging a GitHub issue for an automated, end-to-end
+code-generation pipeline. You are running inside a checkout of the TARGET
+repository — investigate it (its code, layout, and docs) to ground your
+understanding before answering, e.g. to learn the pipeline's actual stages
+rather than guessing.
 
 ISSUE #<<<NUM>>>: <<<TITLE>>>
 ---
