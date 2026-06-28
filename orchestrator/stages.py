@@ -192,7 +192,7 @@ def handle_review(gh, ledger, issue):
     n = issue["number"]
     meta = issue_meta(n)
     pr = gh.get_pull(meta["pr_number"])
-    diff = gh.pull_diff(meta["pr_number"])[:60000]      # keep prompt bounded
+    diff = gh.pull_diff(meta["pr_number"])              # full diff; review sees everything
     summary = _last_bot_summary(gh, n)
     discussion = _discussion(gh, n, issue=issue, pr_number=meta["pr_number"])
     prompt = prompts.render(prompts.REVIEW, NUM=n, TITLE=issue["title"],
