@@ -187,6 +187,23 @@ def test_run_forwards_exclude_family(monkeypatch):
     assert captured["exclude"] == "claude"
 
 
+# ── review-round attribution ────────────────────────────────────────────────
+def test_fmt_tokens_rounds_to_two_significant_figures():
+    assert stages._fmt_tokens(69088) == "69ktok"
+    assert stages._fmt_tokens(1234) == "1.2ktok"
+    assert stages._fmt_tokens(8523) == "8.5ktok"
+    assert stages._fmt_tokens(950) == "950tok"
+    assert stages._fmt_tokens(12) == "12tok"
+    assert stages._fmt_tokens(0) == "0tok"
+    assert stages._fmt_tokens(1_260_000) == "1.3Mtok"
+
+
+def test_participant_notes_model_effort_and_tokens():
+    res = RunResult(ok=True, text="", input_tokens=10000, output_tokens=2000)
+    p = stages._participant("spec", "claude", res)
+    assert "claude-opus-4-8" in p and "high" in p and "12ktok" in p
+
+
 # ── spec author<->reviewer loop ──────────────────────────────────────────────
 def _R(data):
     return RunResult(ok=True, text="", data=data)
@@ -202,9 +219,11 @@ def _spec_env(monkeypatch, seq):
     monkeypatch.setattr(stages, "issue_meta", lambda n: {})
     out = {}
     monkeypatch.setattr(stages, "_publish_specs",
-                        lambda gh, n, path, specs: out.update(published=specs))
+                        lambda gh, n, path, specs, round_note="":
+                        out.update(published=specs, note=round_note))
     monkeypatch.setattr(stages, "_escalate_spec",
-                        lambda gh, n, specs, reason: out.update(escalated=(specs, reason)))
+                        lambda gh, n, specs, reason, round_note="":
+                        out.update(escalated=(specs, reason), note=round_note))
     return out
 
 
@@ -216,6 +235,10 @@ def test_spec_publishes_when_reviewer_happy(monkeypatch):
     stages.handle_spec(object(), None, {"number": 1, "title": "T"})
     assert out.get("published") == [{"title": "A"}]
     assert "escalated" not in out
+    # the round note names BOTH participants (author + reviewer model)
+    assert "claude-opus-4-8" in out["note"]      # spec author
+    assert "glm-5.2" in out["note"]              # peer reviewer
+    assert "round 1" in out["note"]
 
 
 def test_spec_loops_then_publishes_the_revised_specs(monkeypatch):

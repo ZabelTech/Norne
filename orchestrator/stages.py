@@ -22,6 +22,26 @@ def _model_for(stage, fam):
     return table[stage]
 
 
+def _fmt_tokens(n):
+    """Token total rounded to 2 significant figures, human-readable (e.g. 69ktok)."""
+    n = int(n)
+    if n <= 0:
+        return "0tok"
+    f = 10 ** (math.floor(math.log10(n)) - 1)        # round to 2 significant figures
+    n = int(round(n / f) * f)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "Mtok"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}".rstrip("0").rstrip(".") + "ktok"
+    return f"{n}tok"
+
+
+def _participant(stage, fam, res):
+    """`**model** (effort, Ntok)` for one stage run — for the review-round note."""
+    return (f"**{_model_for(stage, fam)}** ({config.EFFORT_BY_STAGE[stage]}, "
+            f"{_fmt_tokens(res.input_tokens + res.output_tokens)})")
+
+
 def _discussion(gh, n, issue=None, pr_number=None):
     """The full discussion a stage should weigh: the issue description and every
     issue comment, plus the PR description and its conversation + inline review
@@ -134,25 +154,30 @@ def handle_spec(gh, ledger, issue):
         summary += f"\n\nHUMAN GUIDANCE:\n{guidance}"
     discussion = _discussion(gh, n, issue=issue)
 
-    specs, concerns, feedback = None, [], "(none)"
+    specs, concerns, feedback, note = None, [], "(none)", ""
     for rnd in range(1, config.MAX_SPEC_ROUNDS + 1):
         fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
                         TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
                         FEEDBACK=feedback), cwd=path)
+        author = _participant("spec", fam, res)
         d = res.data
         if d.get("status") != "ready" or not d.get("specs"):
             # the author itself hit a judgement call it should not make alone
             _escalate_spec(gh, n, d.get("specs"),
-                           d.get("reason") or "Spec generation needs input.")
+                           d.get("reason") or "Spec generation needs input.",
+                           round_note=f"🔎 Spec round {rnd} — author {author} "
+                                      "(stopped before review).")
             return
         specs = d["specs"]
         # diversity-of-thought: a DIFFERENT family peer-reviews the specs
-        _, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                      SPECS=_specs_text(specs), DISCUSSION=discussion),
-                      cwd=path, exclude_family=fam)
+        rfam, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
+                         SPECS=_specs_text(specs), DISCUSSION=discussion),
+                         cwd=path, exclude_family=fam)
+        reviewer = _participant("review", rfam, rev)
+        note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
         concerns = rev.data.get("concerns") or []
         if rev.data.get("verdict") != "concerns" or not concerns:
-            _publish_specs(gh, n, path, specs)         # reviewer happy
+            _publish_specs(gh, n, path, specs, round_note=note)   # reviewer happy
             return
         # loop: hand the draft + concerns back to the author to revise
         feedback = (f"YOUR PREVIOUS DRAFT:\n{_specs_text(specs)}\n\n"
@@ -161,7 +186,8 @@ def handle_spec(gh, ledger, issue):
     # exhausted the loop without convergence -> human judgement call
     _escalate_spec(gh, n, specs,
                    f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
-                   "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns))
+                   "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns),
+                   round_note=note)
 
 
 def _spec_sub_issues(gh, n, specs):
@@ -186,13 +212,13 @@ def _spec_sub_issues(gh, n, specs):
     return numbers
 
 
-def _publish_specs(gh, n, path, specs):
+def _publish_specs(gh, n, path, specs, round_note=""):
     """Reviewer is happy: post sub-issues, commit specs + branch, go implement."""
     subs = _spec_sub_issues(gh, n, specs)
-    _commit_specs_and_branch(gh, n, path, specs, subs)
+    _commit_specs_and_branch(gh, n, path, specs, subs, round_note)
 
 
-def _escalate_spec(gh, n, specs, reason):
+def _escalate_spec(gh, n, specs, reason, round_note=""):
     """Judgement call: post the proposed specs as sub-issues and pause for a human."""
     subs = _spec_sub_issues(gh, n, specs)
     if specs:
@@ -200,10 +226,12 @@ def _escalate_spec(gh, n, specs, reason):
     if subs:
         reason += ("\n\nProposed specs posted as sub-issues: "
                    + ", ".join(f"#{m}" for m in subs))
+    if round_note:
+        reason += f"\n\n{round_note}"
     _pause(gh, n, reason)
 
 
-def _commit_specs_and_branch(gh, n, path, specs, subs=None):
+def _commit_specs_and_branch(gh, n, path, specs, subs=None, round_note=""):
     base = gh.default_branch()
     branch = f"pipeline/issue-{n}"
     repo.checkout_branch(path, branch, base)
@@ -213,7 +241,10 @@ def _commit_specs_and_branch(gh, n, path, specs, subs=None):
                       human_guidance=None, pending_specs=None)
     gh.set_flow(n, config.FLOW_IMPLEMENT, gh.get_issue(n))
     sub_txt = (" Sub-issues: " + ", ".join(f"#{m}" for m in subs)) if subs else ""
-    gh.comment(n, f"🛠️ Spec'd into {len(specs)} spec(s) on `{branch}`.{sub_txt} Implementing.")
+    body = f"🛠️ Spec'd into {len(specs)} spec(s) on `{branch}`.{sub_txt} Implementing."
+    if round_note:
+        body += f"\n\n{round_note}"
+    gh.comment(n, body)
 
 
 def handle_implement(gh, ledger, issue):
