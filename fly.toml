@@ -1,12 +1,12 @@
 # fly.toml — single always-on Machine. Deploy with: fly deploy
 # Create the app + volume once:
-#   fly apps create gh-orchestrator
-#   fly volumes create orchestrator_data --size 1 --region <your-region>
+#   fly apps create norne
+#   fly volumes create norne_data --size 1 --region <your-region>
 # Then set secrets (see README "Secrets" — and do NOT set ANTHROPIC_API_KEY):
 #   fly secrets set GH_TOKEN=... GH_REPO=owner/repo \
 #       CLAUDE_CODE_OAUTH_TOKEN=... ZAI_AUTH_TOKEN=... BOT_LOGIN=...
 
-app = "gh-orchestrator"
+app = "norne"
 primary_region = "ams"   # set to your nearest Fly region
 
 [build]
@@ -28,7 +28,7 @@ primary_region = "ams"   # set to your nearest Fly region
   memory = "1gb"
 
 [mounts]
-  source = "orchestrator_data"
+  source = "norne_data"
   destination = "/data"
 
 # Never auto-stop: it's a long-running poll loop.

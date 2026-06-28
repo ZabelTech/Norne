@@ -81,8 +81,8 @@ claude setup-token            # copy the sk-ant-oat01-... value
 
 ### 2. Create the Fly app + volume
 ```bash
-fly apps create gh-orchestrator
-fly volumes create orchestrator_data --size 1 --region ams   # your region
+fly apps create norne
+fly volumes create norne_data --size 1 --region ams   # your region
 ```
 
 ### 3. Set secrets — ⚠️ do NOT set ANTHROPIC_API_KEY anywhere
