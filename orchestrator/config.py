@@ -30,6 +30,20 @@ TRIGGER_LABEL = os.environ.get("TRIGGER_LABEL", "pipeline")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 WORKDIR_ROOT = os.environ.get("WORKDIR_ROOT", os.path.join(DATA_DIR, "work"))
 
+# ── Instructions (two-layer: general + per-stage) ────────────────────────
+# Instructions directory lives at the repo root (config.py is at orchestrator/config.py)
+_INSTRUCTIONS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INSTRUCTIONS_DIR = os.environ.get("INSTRUCTIONS_DIR", os.path.join(_INSTRUCTIONS_ROOT, "instructions"))
+INSTRUCTIONS_INJECT_GENERAL = _b("INSTRUCTIONS_INJECT_GENERAL", "true")
+INSTRUCTION_FOLDER_BY_STEP = {
+    "summarize": "summarize",
+    "spec": "spec",
+    "spec_review": "spec",
+    "implement": "implement",
+    "fix": "implement",
+    "review": "review",
+}
+
 # ── Budget gate (soft) ────────────────────────────────────────────────────
 # Anthropic does not publish exact per-window token allowances and they vary
 # with server load, so these are *soft* calibration knobs. Start conservative,
