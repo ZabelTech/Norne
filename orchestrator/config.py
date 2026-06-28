@@ -100,16 +100,21 @@ CLAUDE_MODEL_BY_STAGE = {
     "review":    "claude-opus-4-8",
 }
 
-# Reasoning-effort label per stage. Carried in the bot-comment marker
-# [norne-{model}-{effort}] for traceability — light stages stay cheap, the
-# reasoning-heavy spec/review stages run hot. (Metadata today; ready to wire to
-# a real per-call effort knob if the runners gain one.)
-EFFORT_BY_STAGE = {
-    "summarize": "high",   # research + clarify + summarize is reasoning-heavy
-    "spec":      "high",
-    "implement": "medium",
-    "review":    "high",
+# Reasoning effort per MODEL (not per stage): a run uses the effort of whichever
+# model the router actually picked, so you can dial a specific (big/expensive)
+# model independently. Carried in the bot-comment marker [norne-{model}-{effort}].
+# Unknown models default to medium.
+EFFORT_BY_MODEL = {
+    "claude-opus-4-8":   "medium",
+    "claude-sonnet-4-6": "medium",
+    "glm-5.2":           "medium",
+    "glm-4.7":           "medium",
 }
+
+
+def effort_for(model):
+    """The reasoning-effort level for a model (defaults to medium)."""
+    return EFFORT_BY_MODEL.get(model, "medium")
 
 # What an effort label actually DOES to a run: a reasoning directive prepended
 # to the prompt (the "think"/"think hard" keywords trigger Claude Code's

@@ -78,23 +78,31 @@ def test_review_uses_each_familys_best_model():
     assert config.GLM_MODEL_BY_STAGE["review"] == "glm-5.2"
 
 
-def test_review_runs_high_effort():
-    assert config.EFFORT_BY_STAGE["review"] == "high"
+def test_opus_and_glm_run_at_medium_effort():
+    assert config.effort_for("claude-opus-4-8") == "medium"
+    assert config.effort_for("glm-5.2") == "medium"
+    assert config.effort_for("glm-4.7") == "medium"
+
+
+def test_effort_for_defaults_to_medium_on_unknown_model():
+    assert config.effort_for("some-future-model") == "medium"
 
 
 def test_spec_round_cap_is_a_positive_int():
     assert isinstance(config.MAX_SPEC_ROUNDS, int) and config.MAX_SPEC_ROUNDS >= 1
 
 
-def test_effort_map_covers_every_stage():
-    # Every routed stage needs an effort label for its bot-comment marker.
-    assert set(config.EFFORT_BY_STAGE) == set(config.ROUTING)
-
-
-def test_every_stage_effort_is_tunable():
-    # Each effort label used by a stage must resolve to a real tuning entry.
-    for effort in config.EFFORT_BY_STAGE.values():
+def test_every_models_effort_is_tunable():
+    # Each per-model effort label must resolve to a real tuning entry.
+    for effort in config.EFFORT_BY_MODEL.values():
         assert effort in config.EFFORT_TUNING
+
+
+def test_effort_covers_every_routed_model():
+    # Every model the router can pick must have an effort entry (else it would
+    # silently default; an explicit entry keeps the marker honest).
+    routed = set(config.GLM_MODEL_BY_STAGE.values()) | set(config.CLAUDE_MODEL_BY_STAGE.values())
+    assert routed <= set(config.EFFORT_BY_MODEL)
 
 
 def test_effort_tuning_entries_well_formed():

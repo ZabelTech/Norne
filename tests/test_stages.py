@@ -161,7 +161,8 @@ def test_run_passes_stage_effort_to_runner(monkeypatch):
     monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
 
     stages._run("summarize", led, "P", cwd="/w")
-    assert runner.seen["effort"] == config.EFFORT_BY_STAGE["summarize"]  # "high"
+    # effort is derived from the chosen model (glm here), not the stage
+    assert runner.seen["effort"] == config.effort_for(config.GLM_MODEL_BY_STAGE["summarize"])
 
 
 def test_run_raises_budget_parked_when_no_family(monkeypatch):
@@ -201,7 +202,8 @@ def test_fmt_tokens_rounds_to_two_significant_figures():
 def test_participant_notes_model_effort_and_tokens():
     res = RunResult(ok=True, text="", input_tokens=10000, output_tokens=2000)
     p = stages._participant("spec", "claude", res)
-    assert "claude-opus-4-8" in p and "high" in p and "12ktok" in p
+    assert "claude-opus-4-8" in p and config.effort_for("claude-opus-4-8") in p
+    assert "12ktok" in p
 
 
 # ── escalation reason (parse-failure surfacing) ──────────────────────────────

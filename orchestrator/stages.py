@@ -40,7 +40,8 @@ def _fmt_tokens(n):
 
 def _participant(stage, fam, res):
     """`**model** (effort, Ntok)` for one stage run — for the review-round note."""
-    return (f"**{_model_for(stage, fam)}** ({config.EFFORT_BY_STAGE[stage]}, "
+    model = _model_for(stage, fam)
+    return (f"**{model}** ({config.effort_for(model)}, "
             f"{_fmt_tokens(res.input_tokens + res.output_tokens)})")
 
 
@@ -106,7 +107,7 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
         log(f"  {stage}: no model family has budget headroom -> parking")
         raise BudgetParked()
     model = _model_for(stage, fam)
-    effort = config.EFFORT_BY_STAGE[stage]
+    effort = config.effort_for(model)
     log(f"  {stage}: calling {fam}/{model} ({effort})…")
     t0 = time.time()
     runner = runners.get_runner(fam)
@@ -142,7 +143,8 @@ def handle_summarize(gh, ledger, issue):
                             CLARIFICATIONS=human)
     # Run inside a checkout so the model can investigate the repo, not just /data.
     fam, res = _run("summarize", ledger, prompt, cwd=repo.ensure_repo(n))
-    model, effort = _model_for("summarize", fam), config.EFFORT_BY_STAGE["summarize"]
+    model = _model_for("summarize", fam)
+    effort = config.effort_for(model)
     d = res.data
     if d.get("status") == "ready":
         gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
@@ -358,7 +360,8 @@ def handle_review(gh, ledger, issue):
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=path,
                     exclude_family=meta.get("implementer"))
-    model, effort = _model_for("review", fam), config.EFFORT_BY_STAGE["review"]
+    model = _model_for("review", fam)
+    effort = config.effort_for(model)
     tok = res.input_tokens + res.output_tokens
     status = res.data.get("status")
     if status == "approve":
