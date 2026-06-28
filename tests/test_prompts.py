@@ -88,6 +88,13 @@ def test_spec_review_weighs_author_responses():
     assert "RTEXT" in out and "<<<" not in out
 
 
+def test_spec_review_only_blocking_concerns_and_stops_when_satisfied():
+    t = prompts.SPEC_REVIEW
+    assert "blocking" in t                 # raise only material/blocking problems
+    assert "nitpick" in t.lower()          # explicitly not nitpicks
+    assert "MOSTLY satisfied" in t         # approve when broadly happy
+
+
 def test_every_stage_template_ends_with_a_json_contract():
     for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
                 prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):
