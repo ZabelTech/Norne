@@ -222,7 +222,9 @@ def handle_spec(gh, ledger, issue):
     if rnd >= config.MAX_SPEC_ROUNDS:
         _reset_spec_loop(n)
         log(f"[#{n}] spec round {rnd}: still {len(concerns)} concern(s) after "
-            f"MAX_SPEC_ROUNDS -> escalate (human:needed)")
+            f"MAX_SPEC_ROUNDS -> escalate (human:needed):")
+        for c in concerns:
+            log(f"    • {str(c)[:200]}")
         _escalate_spec(gh, n, specs,
                        f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
                        "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns),
@@ -233,10 +235,12 @@ def handle_spec(gh, ledger, issue):
           f"PEER-REVIEW CONCERNS (round {rnd}) to resolve:\n"
           + "\n".join(f"- {c}" for c in concerns))
     update_issue_meta(n, spec_round=rnd, spec_feedback=fb)
-    gh.comment(n, f"🔁 Peer review raised {len(concerns)} concern(s); revising next "
-                  f"round.\n\n{note}")
-    log(f"[#{n}] spec round {rnd}: {len(concerns)} concern(s) -> checkpoint, "
-        f"revising on next tick (stays flow:spec)")
+    concern_list = "\n".join(f"- {c}" for c in concerns)
+    gh.comment(n, f"🔁 **Peer review raised {len(concerns)} concern(s)** "
+                  f"(round {rnd}) — revising next round:\n{concern_list}\n\n{note}")
+    log(f"[#{n}] spec round {rnd}: {len(concerns)} concern(s) raised -> checkpoint, revising:")
+    for c in concerns:
+        log(f"    • {str(c)[:200]}")
     # stays at flow:spec -> the next tick runs round rnd+1
 
 

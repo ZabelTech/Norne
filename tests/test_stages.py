@@ -249,8 +249,11 @@ def _R(data):
 
 
 class _SpecGH:
-    def comment(self, *a, **k):    # the per-round checkpoint comment
-        pass
+    def __init__(self):
+        self.comments = []
+
+    def comment(self, n, body, **k):    # capture the per-round checkpoint comment
+        self.comments.append(body)
 
 
 def _spec_env(monkeypatch, seq):
@@ -274,7 +277,9 @@ def _spec_env(monkeypatch, seq):
 
 
 def _tick():
-    stages.handle_spec(_SpecGH(), None, {"number": 1, "title": "T"})
+    gh = _SpecGH()
+    stages.handle_spec(gh, None, {"number": 1, "title": "T"})
+    return gh
 
 
 def test_spec_publishes_first_round_when_reviewer_happy(monkeypatch):
@@ -296,10 +301,11 @@ def test_spec_checkpoints_on_concerns_then_publishes_next_tick(monkeypatch):
         ("claude", _R({"status": "ready", "specs": [{"title": "v2"}]})),  # tick2 revise
         ("glm", _R({"verdict": "ok", "concerns": []})),                   # tick2 happy
     ])
-    _tick()                                              # round 1 -> checkpoint
+    gh = _tick()                                         # round 1 -> checkpoint
     assert "published" not in out and "escalated" not in out
     assert out["meta"]["spec_round"] == 1
     assert "v1" in out["meta"]["spec_feedback"]          # draft carried forward
+    assert any("c1" in b for b in gh.comments)           # the raised concern is noted down
     _tick()                                              # round 2 -> publish revised
     assert out.get("published") == [{"title": "v2"}]
     assert "round 2" in out["note"]
