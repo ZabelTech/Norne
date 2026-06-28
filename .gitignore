@@ -1,0 +1,24 @@
+# Secrets — never commit real credentials (use .env.example as the template)
+.env
+.env.*
+!.env.example
+
+# Local orchestrator state / work trees (see DATA_DIR, WORKDIR_ROOT)
+/data/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

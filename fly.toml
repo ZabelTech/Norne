@@ -1,0 +1,36 @@
+# fly.toml — single always-on Machine. Deploy with: fly deploy
+# Create the app + volume once:
+#   fly apps create gh-orchestrator
+#   fly volumes create orchestrator_data --size 1 --region <your-region>
+# Then set secrets (see README "Secrets" — and do NOT set ANTHROPIC_API_KEY):
+#   fly secrets set GH_TOKEN=... GH_REPO=owner/repo \
+#       CLAUDE_CODE_OAUTH_TOKEN=... ZAI_AUTH_TOKEN=... BOT_LOGIN=...
+
+app = "gh-orchestrator"
+primary_region = "ams"   # set to your nearest Fly region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLL_INTERVAL = "30"          # seconds between GitHub polls
+  GLM_RUNNER = "pi"             # "pi" or "claude-code-zai"
+  GLM_TIER = "lite"             # lite | pro | max  (sizes the GLM budget)
+  ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
+  AUTO_MERGE = "false"          # false = a human clicks merge
+  MAX_REVIEW_ROUNDS = "3"
+  TRIGGER_LABEL = "pipeline"    # an issue enters the pipeline when it has this label
+
+# This is a worker, not a web server. No public services / ports.
+# Keep exactly one instance so the state machine has a single writer.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[mounts]
+  source = "orchestrator_data"
+  destination = "/data"
+
+# Never auto-stop: it's a long-running poll loop.
+[deploy]
+  strategy = "immediate"
