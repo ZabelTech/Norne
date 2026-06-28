@@ -204,6 +204,25 @@ def test_participant_notes_model_effort_and_tokens():
     assert "claude-opus-4-8" in p and "high" in p and "12ktok" in p
 
 
+# ── escalation reason (parse-failure surfacing) ──────────────────────────────
+def test_failure_reason_prefers_the_models_own_reason():
+    res = RunResult(ok=True, text="x", data={"status": "needs_human", "reason": "need a call"})
+    assert stages._failure_reason(res, "default") == "need a call"
+
+
+def test_failure_reason_surfaces_raw_text_when_output_did_not_parse():
+    res = RunResult(ok=True, text="I dug in but I'm stuck on the loader path.", data={})
+    r = stages._failure_reason(res, "default")
+    assert "didn't parse" in r and "stuck on the loader path" in r
+
+
+def test_failure_reason_falls_back_to_default_when_nothing_useful():
+    assert stages._failure_reason(RunResult(ok=True, text="", data={}), "DEF") == "DEF"
+    # parsed something but no reason -> default, not a raw dump
+    assert stages._failure_reason(
+        RunResult(ok=True, text="x", data={"status": "weird"}), "DEF") == "DEF"
+
+
 def test_pause_records_comment_baseline(monkeypatch):
     posted = {}
 
@@ -308,6 +327,18 @@ def test_spec_author_judgement_call_escalates(monkeypatch):
     ])
     _tick()
     assert out["escalated"][1] == "ambiguous"
+    assert "author stopped before review" in out["note"]
+
+
+def test_spec_parse_failure_surfaces_the_agents_message(monkeypatch):
+    out = _spec_env(monkeypatch, [
+        ("claude", RunResult(ok=True, text="Investigated heavily; stuck on X.", data={})),
+    ])
+    _tick()
+    assert "escalated" in out
+    assert "didn't parse" in out["escalated"][1]
+    assert "stuck on X" in out["escalated"][1]            # the agent's words surfaced
+    assert "output didn't parse" in out["note"]           # round note distinguishes it
 
 
 def test_spec_sub_issues_creates_once_then_dedupes(monkeypatch):

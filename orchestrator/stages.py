@@ -42,6 +42,21 @@ def _participant(stage, fam, res):
             f"{_fmt_tokens(res.input_tokens + res.output_tokens)})")
 
 
+def _failure_reason(res, default):
+    """A human-useful reason for an escalation. Prefer the model's own `reason`;
+    if its output didn't parse into the json contract (no result block), surface
+    its actual final message so the human sees what happened — not a blank
+    'needs input'. Fall back to `default` only when there's genuinely nothing."""
+    if res.data.get("reason"):
+        return res.data["reason"]
+    if not res.data:                              # nothing parsed out of the reply
+        tail = (res.text or "").strip()[-1500:]
+        if tail:
+            return ("The agent finished without a valid result block — its output "
+                    "didn't parse. Its final message:\n\n> " + tail.replace("\n", "\n> "))
+    return default
+
+
 def _discussion(gh, n, issue=None, pr_number=None):
     """The full discussion a stage should weigh: the issue description and every
     issue comment, plus the PR description and its conversation + inline review
@@ -168,12 +183,13 @@ def handle_spec(gh, ledger, issue):
     author = _participant("spec", fam, res)
     d = res.data
     if d.get("status") != "ready" or not d.get("specs"):
-        # the author itself hit a judgement call it should not make alone
+        # author stopped before review — a real judgement call, OR output that
+        # didn't parse into the json contract (common on long agentic runs).
         _reset_spec_loop(n)
+        why = "output didn't parse" if not d else "author stopped before review"
         _escalate_spec(gh, n, d.get("specs"),
-                       d.get("reason") or "Spec generation needs input.",
-                       round_note=f"🔎 Spec round {rnd} — author {author} "
-                                  "(stopped before review).")
+                       _failure_reason(res, "Spec generation needs input."),
+                       round_note=f"🔎 Spec round {rnd} — author {author} ({why}).")
         return
     specs = d["specs"]
     # diversity-of-thought: a DIFFERENT family peer-reviews the specs
@@ -279,7 +295,7 @@ def handle_implement(gh, ledger, issue):
         prompt = prompts.render(prompts.IMPLEMENT, NUM=n, DISCUSSION=discussion)
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
     if res.data.get("status") != "done":
-        _pause(gh, n, res.data.get("reason") or "Implementation hit a blocker.")
+        _pause(gh, n, _failure_reason(res, "Implementation hit a blocker."))
         return
     repo.commit_all(path, f"implement #{n}" + (f" (fix round {rnd})" if rnd else ""))
     repo.push(path, meta["branch"])
@@ -330,7 +346,7 @@ def handle_review(gh, ledger, issue):
         update_issue_meta(n, review_round=rnd, last_feedback=fb)
         gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
     else:
-        _pause(gh, n, res.data.get("reason") or "Review flagged a judgement call.")
+        _pause(gh, n, _failure_reason(res, "Review flagged a judgement call."))
 
 
 def handle_merge(gh, ledger, issue):
