@@ -17,6 +17,7 @@ from .github_client import GitHub
 from .store import Ledger, issue_meta, update_issue_meta
 from .runners import RateLimited
 from .stages import DISPATCH, BudgetParked
+from .log import log
 
 
 def process_issue(gh, ledger, issue):
@@ -29,7 +30,9 @@ def process_issue(gh, ledger, issue):
         if ledger.headroom("claude") or ledger.headroom("glm"):
             gh.remove_label(n, config.FLAG_BLOCKED_BUDGET)
             labels.discard(config.FLAG_BLOCKED_BUDGET)
+            log(f"[#{n}] budget freed -> resuming")
         else:
+            log(f"[#{n}] skip: blocked:budget (no pool has headroom)")
             return
 
     # Paused on a human judgement call. Resume when you EITHER add the
@@ -44,7 +47,10 @@ def process_issue(gh, ledger, issue):
             gh.remove_label(n, config.FLAG_NEEDS_HUMAN)
             if config.SIG_RESOLVED in labels:
                 gh.remove_label(n, config.SIG_RESOLVED)
+            log(f"[#{n}] human:needed resolved ({'label' if config.SIG_RESOLVED in labels else 'comment'})"
+                f" -> resuming {flow}")
         else:
+            log(f"[#{n}] skip: human:needed (waiting for your reply or human:resolved)")
             return
 
     # New issue entering via the trigger label.
@@ -52,10 +58,12 @@ def process_issue(gh, ledger, issue):
         if config.TRIGGER_LABEL in labels:
             gh.set_flow(n, config.FLOW_SUMMARIZE)
             flow = config.FLOW_SUMMARIZE
+            log(f"[#{n}] triggered -> flow:summarize")
         else:
             return
 
     if flow == config.FLOW_DONE:
+        log(f"[#{n}] skip: flow:done")
         return
 
     # Approval gate. Add the `approve` label to proceed to spec; OR just comment
@@ -66,22 +74,28 @@ def process_issue(gh, ledger, issue):
             gh.remove_label(n, config.SIG_APPROVE)
             gh.set_flow(n, config.FLOW_SPEC)
             flow = config.FLOW_SPEC
+            log(f"[#{n}] approved -> flow:spec")
         else:
             latest = gh.latest_human_comment(n)
             if latest and latest["id"] > issue_meta(n).get("last_comment_seen", 0):
                 gh.set_flow(n, config.FLOW_SUMMARIZE, issue)
+                log(f"[#{n}] approval: new comment -> back to flow:summarize")
+            else:
+                log(f"[#{n}] skip: flow:approval (waiting for `approve` or a comment)")
             return
 
     handler = DISPATCH.get(flow)
     if not handler:
+        log(f"[#{n}] skip: no handler for {flow}")
         return
+    log(f"[#{n}] {flow} — start")
     try:
         handler(gh, ledger, issue)
     except (RateLimited, BudgetParked) as e:
         gh.add_labels(n, [config.FLAG_BLOCKED_BUDGET])
-        print(f"[#{n}] parked (budget: {getattr(e, 'pool', 'all pools tapped')})")
+        log(f"[#{n}] parked: blocked:budget ({getattr(e, 'pool', 'all pools tapped')})")
     except Exception as e:                       # never let one issue kill the loop
-        print(f"[#{n}] ERROR: {e}")
+        log(f"[#{n}] ERROR in {flow}: {e}")
         traceback.print_exc()
 
 
@@ -101,12 +115,14 @@ def _worker(gh, work, inflight, lock):
     while True:
         issue = work.get()
         n = issue["number"]
+        t0 = time.time()
         try:
             process_issue(gh, Ledger(), issue)       # fresh ledger view per issue
         except Exception as e:                        # never let one issue kill the worker
-            print(f"[#{n}] error: {e}")
+            log(f"[#{n}] worker error: {e}")
             traceback.print_exc()
         finally:
+            log(f"[#{n}] worker done ({int(time.time() - t0)}s)")
             with lock:
                 inflight.discard(n)
             work.task_done()
@@ -114,8 +130,8 @@ def _worker(gh, work, inflight, lock):
 
 def main():
     gh = GitHub()
-    print(f"orchestrator up — repo={config.GH_REPO} glm_runner={config.GLM_RUNNER} "
-          f"tier={config.GLM_TIER} auto_merge={config.AUTO_MERGE}")
+    log(f"orchestrator up — repo={config.GH_REPO} glm_runner={config.GLM_RUNNER} "
+        f"tier={config.GLM_TIER} auto_merge={config.AUTO_MERGE} poll={config.POLL_INTERVAL}s")
     work = queue.Queue()
     inflight = set()
     lock = threading.Lock()
@@ -123,15 +139,22 @@ def main():
                      name="worker", daemon=True).start()
     while True:
         try:
-            for issue in candidates(gh):
+            cands = candidates(gh)
+            dispatched, busy = [], []
+            for issue in cands:
                 n = issue["number"]
                 with lock:
                     if n in inflight:                # already queued or in progress
+                        busy.append(n)
                         continue
                     inflight.add(n)
                 work.put(issue)
+                dispatched.append(n)
+            if cands:                                # only log polls that saw work
+                log(f"poll: candidates={[i['number'] for i in cands]} "
+                    f"dispatched={dispatched} in-flight(skipped)={busy}")
         except Exception as e:
-            print(f"loop error: {e}")
+            log(f"loop error: {e}")
             traceback.print_exc()
         time.sleep(config.POLL_INTERVAL)
 

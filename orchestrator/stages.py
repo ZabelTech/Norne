@@ -6,8 +6,10 @@ transitions the flow label. Per-issue detail (branch, PR#, review round,
 implementer family, paused guidance) lives in store.issue_meta.
 """
 import math
+import time
 from . import config, prompts, repo, runners, router
 from .github_client import is_bot_comment
+from .log import log
 from .runners import RateLimited
 from .store import issue_meta, update_issue_meta
 
@@ -101,11 +103,17 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
     """Route -> run -> meter. Raises BudgetParked if nothing has headroom."""
     fam = router.choose_family(stage, ledger, exclude_family=exclude_family)
     if fam is None:
+        log(f"  {stage}: no model family has budget headroom -> parking")
         raise BudgetParked()
+    model = _model_for(stage, fam)
+    effort = config.EFFORT_BY_STAGE[stage]
+    log(f"  {stage}: calling {fam}/{model} ({effort})…")
+    t0 = time.time()
     runner = runners.get_runner(fam)
-    res = runner.run(prompt, cwd=cwd, write=write, model=_model_for(stage, fam),
-                     effort=config.EFFORT_BY_STAGE[stage])
+    res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
     _record(ledger, fam, res)
+    log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
+        f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
     return fam, res
 
 
@@ -142,12 +150,14 @@ def handle_summarize(gh, ledger, issue):
                       f"— or just comment to ask for changes.",
                    model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_APPROVAL, issue)
+        log(f"[#{n}] summarize -> ready, flow:approval")
     else:
         qs = "\n".join(f"- {q}" for q in d.get("questions", [])) or "- (clarify)"
         gh.comment(n, f"📋 **Summary (draft)**\n\n{d.get('summary','')}\n\n"
                       f"**A few questions before I spec this:**\n{qs}",
                    model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_CLARIFY, issue)
+        log(f"[#{n}] summarize -> {len(d.get('questions', []))} question(s), flow:clarify")
 
 
 def handle_clarify(gh, ledger, issue):
@@ -157,6 +167,9 @@ def handle_clarify(gh, ledger, issue):
     seen = issue_meta(n).get("last_comment_seen", 0)
     if latest and latest["id"] > seen:
         gh.set_flow(n, config.FLOW_SUMMARIZE, issue)   # re-run next tick with the reply
+        log(f"[#{n}] clarify: new reply -> flow:summarize")
+    else:
+        log(f"[#{n}] clarify: waiting for your reply")
 
 
 def handle_spec(gh, ledger, issue):
@@ -187,6 +200,7 @@ def handle_spec(gh, ledger, issue):
         # didn't parse into the json contract (common on long agentic runs).
         _reset_spec_loop(n)
         why = "output didn't parse" if not d else "author stopped before review"
+        log(f"[#{n}] spec round {rnd}: author stopped ({why}) -> escalate (human:needed)")
         _escalate_spec(gh, n, d.get("specs"),
                        _failure_reason(res, "Spec generation needs input."),
                        round_note=f"🔎 Spec round {rnd} — author {author} ({why}).")
@@ -201,10 +215,14 @@ def handle_spec(gh, ledger, issue):
     concerns = rev.data.get("concerns") or []
     if rev.data.get("verdict") != "concerns" or not concerns:
         _reset_spec_loop(n)
+        log(f"[#{n}] spec round {rnd}: reviewer approved -> publishing "
+            f"{len(specs)} spec(s), flow:implement")
         _publish_specs(gh, n, path, specs, round_note=note)        # reviewer happy
         return
     if rnd >= config.MAX_SPEC_ROUNDS:
         _reset_spec_loop(n)
+        log(f"[#{n}] spec round {rnd}: still {len(concerns)} concern(s) after "
+            f"MAX_SPEC_ROUNDS -> escalate (human:needed)")
         _escalate_spec(gh, n, specs,
                        f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
                        "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns),
@@ -217,6 +235,8 @@ def handle_spec(gh, ledger, issue):
     update_issue_meta(n, spec_round=rnd, spec_feedback=fb)
     gh.comment(n, f"🔁 Peer review raised {len(concerns)} concern(s); revising next "
                   f"round.\n\n{note}")
+    log(f"[#{n}] spec round {rnd}: {len(concerns)} concern(s) -> checkpoint, "
+        f"revising on next tick (stays flow:spec)")
     # stays at flow:spec -> the next tick runs round rnd+1
 
 
@@ -293,8 +313,10 @@ def handle_implement(gh, ledger, issue):
                                 FEEDBACK=meta["last_feedback"], DISCUSSION=discussion)
     else:
         prompt = prompts.render(prompts.IMPLEMENT, NUM=n, DISCUSSION=discussion)
+    log(f"[#{n}] implement: {'fix round ' + str(rnd) if rnd else 'first pass'}")
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
     if res.data.get("status") != "done":
+        log(f"[#{n}] implement: not done -> escalate (human:needed)")
         _pause(gh, n, _failure_reason(res, "Implementation hit a blocker."))
         return
     repo.commit_all(path, f"implement #{n}" + (f" (fix round {rnd})" if rnd else ""))
@@ -307,6 +329,7 @@ def handle_implement(gh, ledger, issue):
                             base=gh.default_branch(), body=body)
     update_issue_meta(n, pr_number=pr["number"], implementer=fam)
     gh.set_flow(n, config.FLOW_REVIEW, issue)
+    log(f"[#{n}] implement: done by {fam} -> PR #{pr['number']}, flow:review")
 
 
 def handle_review(gh, ledger, issue):
@@ -333,9 +356,12 @@ def handle_review(gh, ledger, issue):
         gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}",
                    model=model, effort=effort, tokens=tok)
         gh.set_flow(n, config.FLOW_MERGE, issue)
+        log(f"[#{n}] review: approved by {fam} -> flow:merge")
     elif status == "request_changes":
         rnd = meta.get("review_round", 0) + 1
         if rnd > config.MAX_REVIEW_ROUNDS:
+            log(f"[#{n}] review: still failing after {config.MAX_REVIEW_ROUNDS} rounds "
+                f"-> escalate (human:needed)")
             _pause(gh, n, f"Still failing review after {config.MAX_REVIEW_ROUNDS} rounds. "
                           "Take a look.")
             return
@@ -345,7 +371,9 @@ def handle_review(gh, ledger, issue):
                    model=model, effort=effort, tokens=tok)
         update_issue_meta(n, review_round=rnd, last_feedback=fb)
         gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
+        log(f"[#{n}] review: changes requested (round {rnd}, by {fam}) -> flow:implement")
     else:
+        log(f"[#{n}] review: needs_human -> escalate")
         _pause(gh, n, _failure_reason(res, "Review flagged a judgement call."))
 
 
@@ -355,12 +383,16 @@ def handle_merge(gh, ledger, issue):
     if pr.get("merged"):
         gh.set_flow(n, config.FLOW_DONE, issue)
         gh.comment(n, "🎉 Merged. Done.")
+        log(f"[#{n}] merge: PR #{pr.get('number')} merged -> flow:done")
         return
     if config.AUTO_MERGE and pr.get("mergeable") and pr.get("mergeable_state") == "clean":
         gh.merge_pull(pr["number"])
         gh.set_flow(n, config.FLOW_DONE, issue)
         gh.comment(n, "🎉 Auto-merged on green. Done.")
-    # else: wait for a human to click merge
+        log(f"[#{n}] merge: auto-merged -> flow:done")
+    else:
+        log(f"[#{n}] merge: waiting for you to click merge "
+            f"(mergeable={pr.get('mergeable')}, state={pr.get('mergeable_state')})")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

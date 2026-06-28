@@ -92,3 +92,39 @@ def test_human_needed_still_resumes_on_resolved_label(monkeypatch):
     main.process_issue(gh, ledger=None, issue=_issue())
     assert config.FLAG_NEEDS_HUMAN in gh.removed
     assert config.SIG_RESOLVED in gh.removed
+
+
+# ── skip-reason logging (why an issue isn't advanced) ─────────────────────────
+class _Ledger:
+    def __init__(self, headroom):
+        self._h = headroom
+
+    def headroom(self, pool):
+        return self._h
+
+
+def test_blocked_budget_logs_why_it_is_skipped(monkeypatch, capsys):
+    monkeypatch.setattr(main, "issue_meta", lambda n: {})
+    gh = FakeGH(labels={config.FLOW_SPEC, config.FLAG_BLOCKED_BUDGET})
+    main.process_issue(gh, ledger=_Ledger(False), issue=_issue())
+    out = capsys.readouterr().out
+    assert "blocked:budget" in out and "no pool has headroom" in out
+    assert gh.flow_set == []                              # did not advance
+
+
+def test_approval_gate_waiting_logs_why(monkeypatch, capsys):
+    monkeypatch.setattr(main, "issue_meta", lambda n: {"last_comment_seen": 100})
+    monkeypatch.setattr(main, "DISPATCH", {})
+    gh = FakeGH(labels={config.FLOW_APPROVAL}, latest={"id": 50})   # stale comment
+    main.process_issue(gh, ledger=None, issue=_issue())
+    out = capsys.readouterr().out
+    assert "flow:approval" in out and "waiting" in out
+
+
+def test_human_needed_waiting_logs_why(monkeypatch, capsys):
+    monkeypatch.setattr(main, "issue_meta", lambda n: {"last_comment_seen": 200})
+    monkeypatch.setattr(main, "update_issue_meta", lambda n, **kw: None)
+    gh = FakeGH(labels={config.FLOW_SPEC, config.FLAG_NEEDS_HUMAN}, latest={"id": 200})
+    main.process_issue(gh, ledger=None, issue=_issue())
+    out = capsys.readouterr().out
+    assert "human:needed" in out and "waiting" in out
