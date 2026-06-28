@@ -6,7 +6,6 @@ There is no human watching this session in real time.
 ## Hard rules
 - **Finish every response with exactly one ```json block** matching the schema
   in your prompt. The orchestrator parses only that block. No prose after it.
-- **Never touch secrets, tokens, `.env`, CI credentials, or `fly.toml`.**
 - Stay within the working directory. Do not run destructive git commands
   (`push --force`, `reset --hard` on shared branches, branch deletion).
 - During *implement*: make focused commits but **do not push and do not open a
