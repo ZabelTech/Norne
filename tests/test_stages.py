@@ -229,15 +229,22 @@ def _R(data):
     return RunResult(ok=True, text="", data=data)
 
 
+class _SpecGH:
+    def comment(self, *a, **k):    # the per-round checkpoint comment
+        pass
+
+
 def _spec_env(monkeypatch, seq):
-    """Stub everything handle_spec touches except its loop/escalation logic."""
+    """Stub handle_spec's deps; meta persists across ticks (cross-tick loop)."""
     it = iter(seq)
+    meta = {}
     monkeypatch.setattr(stages, "_run", lambda *a, **k: next(it))
     monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
     monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
-    monkeypatch.setattr(stages, "issue_meta", lambda n: {})
-    out = {}
+    monkeypatch.setattr(stages, "issue_meta", lambda n: dict(meta))
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: meta.update(kw))
+    out = {"meta": meta}
     monkeypatch.setattr(stages, "_publish_specs",
                         lambda gh, n, path, specs, round_note="":
                         out.update(published=specs, note=round_note))
@@ -247,29 +254,37 @@ def _spec_env(monkeypatch, seq):
     return out
 
 
-def test_spec_publishes_when_reviewer_happy(monkeypatch):
+def _tick():
+    stages.handle_spec(_SpecGH(), None, {"number": 1, "title": "T"})
+
+
+def test_spec_publishes_first_round_when_reviewer_happy(monkeypatch):
     out = _spec_env(monkeypatch, [
         ("claude", _R({"status": "ready", "specs": [{"title": "A"}]})),
         ("glm", _R({"verdict": "ok", "concerns": []})),
     ])
-    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
-    assert out.get("published") == [{"title": "A"}]
-    assert "escalated" not in out
-    # the round note names BOTH participants (author + reviewer model)
-    assert "claude-opus-4-8" in out["note"]      # spec author
-    assert "glm-5.2" in out["note"]              # peer reviewer
+    _tick()
+    assert out.get("published") == [{"title": "A"}] and "escalated" not in out
+    assert "claude-opus-4-8" in out["note"] and "glm-5.2" in out["note"]
     assert "round 1" in out["note"]
+    assert out["meta"].get("spec_round") == 0           # loop reset on publish
 
 
-def test_spec_loops_then_publishes_the_revised_specs(monkeypatch):
+def test_spec_checkpoints_on_concerns_then_publishes_next_tick(monkeypatch):
     out = _spec_env(monkeypatch, [
-        ("claude", _R({"status": "ready", "specs": [{"title": "v1"}]})),  # author r1
-        ("glm", _R({"verdict": "concerns", "concerns": ["c1"]})),         # review r1
-        ("claude", _R({"status": "ready", "specs": [{"title": "v2"}]})),  # author r2 revises
-        ("glm", _R({"verdict": "ok", "concerns": []})),                   # review r2 happy
+        ("claude", _R({"status": "ready", "specs": [{"title": "v1"}]})),  # tick1 author
+        ("glm", _R({"verdict": "concerns", "concerns": ["c1"]})),         # tick1 review
+        ("claude", _R({"status": "ready", "specs": [{"title": "v2"}]})),  # tick2 revise
+        ("glm", _R({"verdict": "ok", "concerns": []})),                   # tick2 happy
     ])
-    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
-    assert out.get("published") == [{"title": "v2"}]   # the revised set, not v1
+    _tick()                                              # round 1 -> checkpoint
+    assert "published" not in out and "escalated" not in out
+    assert out["meta"]["spec_round"] == 1
+    assert "v1" in out["meta"]["spec_feedback"]          # draft carried forward
+    _tick()                                              # round 2 -> publish revised
+    assert out.get("published") == [{"title": "v2"}]
+    assert "round 2" in out["note"]
+    assert out["meta"]["spec_round"] == 0
 
 
 def test_spec_escalates_after_max_rounds(monkeypatch):
@@ -280,15 +295,18 @@ def test_spec_escalates_after_max_rounds(monkeypatch):
         ("claude", _R({"status": "ready", "specs": [{"title": "x"}]})),
         ("glm", _R({"verdict": "concerns", "concerns": ["c"]})),
     ])
-    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    _tick()                                              # round 1 -> checkpoint
+    assert "escalated" not in out and out["meta"]["spec_round"] == 1
+    _tick()                                              # round 2 (== max) -> escalate
     assert "escalated" in out and "published" not in out
+    assert out["meta"]["spec_round"] == 0
 
 
 def test_spec_author_judgement_call_escalates(monkeypatch):
     out = _spec_env(monkeypatch, [
         ("claude", _R({"status": "needs_human", "reason": "ambiguous"})),
     ])
-    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    _tick()
     assert out["escalated"][1] == "ambiguous"
 
 

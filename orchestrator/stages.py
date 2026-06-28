@@ -145,53 +145,67 @@ def handle_clarify(gh, ledger, issue):
 
 
 def handle_spec(gh, ledger, issue):
-    """Author the spec(s), then loop: a DIFFERENT family peer-reviews, and the
-    author revises against the concerns — up to MAX_SPEC_ROUNDS. When the
-    reviewer is happy, publish (sub-issues + branch -> implement). If the author
-    hits a judgement call, or the loop can't converge, escalate to a human —
-    posting the proposed specs as sub-issues either way."""
+    """ONE author->peer-review round per tick (cross-tick loop). On concerns it
+    checkpoints the feedback in meta and stays at flow:spec to revise on the next
+    tick; a clean verdict publishes (sub-issues + branch -> implement); reaching
+    MAX_SPEC_ROUNDS without convergence escalates to a human. Running one round
+    per tick (not all rounds inline) keeps the worker free between rounds so the
+    orchestrator stays responsive and a paused issue can resume promptly."""
     n = issue["number"]
     path = repo.ensure_repo(n)
+    meta = issue_meta(n)
     summary = _last_bot_summary(gh, n)
-    guidance = issue_meta(n).get("human_guidance")
+    guidance = meta.get("human_guidance")
     if guidance:
         summary += f"\n\nHUMAN GUIDANCE:\n{guidance}"
     discussion = _discussion(gh, n, issue=issue)
+    rnd = meta.get("spec_round", 0) + 1
+    feedback = meta.get("spec_feedback") or "(none)"
 
-    specs, concerns, feedback, note = None, [], "(none)", ""
-    for rnd in range(1, config.MAX_SPEC_ROUNDS + 1):
-        fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
-                        TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
-                        FEEDBACK=feedback), cwd=path)
-        author = _participant("spec", fam, res)
-        d = res.data
-        if d.get("status") != "ready" or not d.get("specs"):
-            # the author itself hit a judgement call it should not make alone
-            _escalate_spec(gh, n, d.get("specs"),
-                           d.get("reason") or "Spec generation needs input.",
-                           round_note=f"🔎 Spec round {rnd} — author {author} "
-                                      "(stopped before review).")
-            return
-        specs = d["specs"]
-        # diversity-of-thought: a DIFFERENT family peer-reviews the specs
-        rfam, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                         SPECS=_specs_text(specs), DISCUSSION=discussion),
-                         cwd=path, exclude_family=fam)
-        reviewer = _participant("review", rfam, rev)
-        note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
-        concerns = rev.data.get("concerns") or []
-        if rev.data.get("verdict") != "concerns" or not concerns:
-            _publish_specs(gh, n, path, specs, round_note=note)   # reviewer happy
-            return
-        # loop: hand the draft + concerns back to the author to revise
-        feedback = (f"YOUR PREVIOUS DRAFT:\n{_specs_text(specs)}\n\n"
-                    f"PEER-REVIEW CONCERNS (round {rnd}) to resolve:\n"
-                    + "\n".join(f"- {c}" for c in concerns))
-    # exhausted the loop without convergence -> human judgement call
-    _escalate_spec(gh, n, specs,
-                   f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
-                   "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns),
-                   round_note=note)
+    fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
+                    TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
+                    FEEDBACK=feedback), cwd=path)
+    author = _participant("spec", fam, res)
+    d = res.data
+    if d.get("status") != "ready" or not d.get("specs"):
+        # the author itself hit a judgement call it should not make alone
+        _reset_spec_loop(n)
+        _escalate_spec(gh, n, d.get("specs"),
+                       d.get("reason") or "Spec generation needs input.",
+                       round_note=f"🔎 Spec round {rnd} — author {author} "
+                                  "(stopped before review).")
+        return
+    specs = d["specs"]
+    # diversity-of-thought: a DIFFERENT family peer-reviews the specs
+    rfam, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
+                     SPECS=_specs_text(specs), DISCUSSION=discussion),
+                     cwd=path, exclude_family=fam)
+    reviewer = _participant("review", rfam, rev)
+    note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
+    concerns = rev.data.get("concerns") or []
+    if rev.data.get("verdict") != "concerns" or not concerns:
+        _reset_spec_loop(n)
+        _publish_specs(gh, n, path, specs, round_note=note)        # reviewer happy
+        return
+    if rnd >= config.MAX_SPEC_ROUNDS:
+        _reset_spec_loop(n)
+        _escalate_spec(gh, n, specs,
+                       f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
+                       "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns),
+                       round_note=note)
+        return
+    # checkpoint: store the draft + concerns and revise on the next tick
+    fb = (f"YOUR PREVIOUS DRAFT:\n{_specs_text(specs)}\n\n"
+          f"PEER-REVIEW CONCERNS (round {rnd}) to resolve:\n"
+          + "\n".join(f"- {c}" for c in concerns))
+    update_issue_meta(n, spec_round=rnd, spec_feedback=fb)
+    gh.comment(n, f"🔁 Peer review raised {len(concerns)} concern(s); revising next "
+                  f"round.\n\n{note}")
+    # stays at flow:spec -> the next tick runs round rnd+1
+
+
+def _reset_spec_loop(n):
+    update_issue_meta(n, spec_round=0, spec_feedback=None)
 
 
 def _spec_sub_issues(gh, n, specs):

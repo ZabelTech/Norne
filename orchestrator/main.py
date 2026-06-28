@@ -1,9 +1,14 @@
 """Poll loop. One Machine, one writer over the GitHub state machine.
 
-Each tick: find triggered/in-flight issues and advance each one step. The
-budget gate (ledger) and the 429 backstop both funnel into a `blocked:budget`
-park that auto-retries when a usage window resets.
+The poll loop never blocks on a model call: it just discovers triggered/in-flight
+issues and hands each to a SINGLE background worker thread, which advances one
+issue at a time. One worker preserves the single-writer invariant (no concurrent
+state writes) while keeping the main loop responsive (it keeps polling, logging,
+and picking up new comments/labels while a model call runs). The budget gate
+(ledger) and the 429 backstop both funnel into a `blocked:budget` park.
 """
+import queue
+import threading
 import time
 import traceback
 
@@ -91,15 +96,40 @@ def candidates(gh):
     return out
 
 
+def _worker(gh, work, inflight, lock):
+    """Process one issue at a time off the queue (the single writer)."""
+    while True:
+        issue = work.get()
+        n = issue["number"]
+        try:
+            process_issue(gh, Ledger(), issue)       # fresh ledger view per issue
+        except Exception as e:                        # never let one issue kill the worker
+            print(f"[#{n}] error: {e}")
+            traceback.print_exc()
+        finally:
+            with lock:
+                inflight.discard(n)
+            work.task_done()
+
+
 def main():
     gh = GitHub()
     print(f"orchestrator up — repo={config.GH_REPO} glm_runner={config.GLM_RUNNER} "
           f"tier={config.GLM_TIER} auto_merge={config.AUTO_MERGE}")
+    work = queue.Queue()
+    inflight = set()
+    lock = threading.Lock()
+    threading.Thread(target=_worker, args=(gh, work, inflight, lock),
+                     name="worker", daemon=True).start()
     while True:
         try:
-            ledger = Ledger()
             for issue in candidates(gh):
-                process_issue(gh, ledger, issue)
+                n = issue["number"]
+                with lock:
+                    if n in inflight:                # already queued or in progress
+                        continue
+                    inflight.add(n)
+                work.put(issue)
         except Exception as e:
             print(f"loop error: {e}")
             traceback.print_exc()
