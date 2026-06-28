@@ -4,7 +4,9 @@ metering, the rate-limit sniffer, and the billing-safety env scrub.
 No subprocesses are spawned here — only the deterministic helpers are tested.
 """
 import json
+import subprocess
 
+from orchestrator import config
 from orchestrator import runners
 
 
@@ -136,3 +138,57 @@ def test_apply_effort_unknown_effort_defaults_to_medium():
     _, max_turns = runners._apply_effort("P", "bogus")
     from orchestrator import config
     assert max_turns == config.EFFORT_TUNING["medium"]["max_turns"]
+
+
+def test_apply_effort_write_stage_gets_the_turn_floor():
+    # A code-writing stage must get at least the write floor, well above what a
+    # read-and-reason medium run would allow — this is the fix for implement
+    # running out of turns before reporting `done`.
+    _, read_turns = runners._apply_effort("P", "medium")
+    _, write_turns = runners._apply_effort("P", "medium", write=True)
+    assert read_turns == config.EFFORT_TUNING["medium"]["max_turns"]
+    assert write_turns == runners.WRITE_TURN_FLOOR
+    assert write_turns > read_turns
+
+
+def test_apply_effort_write_never_lowers_a_higher_effort_budget():
+    # The floor is a floor, not a cap: if effort already grants more turns than
+    # the floor, keep the larger number.
+    from orchestrator import config
+    config.EFFORT_TUNING["huge"] = {"directive": "", "max_turns": 999}
+    try:
+        _, turns = runners._apply_effort("P", "huge", write=True)
+        assert turns == 999
+    finally:
+        del config.EFFORT_TUNING["huge"]
+
+
+# ── timeout handling ─────────────────────────────────────────────────────────
+def test_run_returns_sentinel_on_timeout(monkeypatch):
+    # A wall-clock kill must come back as (None, "timeout"), distinct from a
+    # clean process exit — callers branch on it.
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+    monkeypatch.setattr(runners.subprocess, "run", boom)
+    res, blob = runners._run(["claude"], cwd=".", env={}, pool="claude")
+    assert res is None
+    assert blob == "timeout"
+
+
+def test_claude_runner_survives_a_timeout(monkeypatch):
+    # The runner must not crash unpacking the sentinel — it returns a clean
+    # ok=False result the dispatcher can escalate on.
+    monkeypatch.setattr(runners, "_run", lambda *a, **k: (None, "timeout"))
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    res = runners.ClaudeCodeRunner().run("PROMPT", cwd=".", model="claude-opus-4-8")
+    assert res.ok is False
+    assert res.data == {}
+    assert res.raw == "timeout"
+
+
+def test_glm_runner_survives_a_timeout(monkeypatch):
+    monkeypatch.setattr(runners, "_run", lambda *a, **k: (None, "timeout"))
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")
+    res = runners.GlmClaudeCodeRunner().run("PROMPT", cwd=".", model="glm-4.7")
+    assert res.ok is False
+    assert res.raw == "timeout"

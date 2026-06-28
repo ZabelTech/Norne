@@ -225,6 +225,46 @@ def test_failure_reason_falls_back_to_default_when_nothing_useful():
         RunResult(ok=True, text="x", data={"status": "weird"}), "DEF") == "DEF"
 
 
+def test_implement_escalation_reports_a_timeout(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=False, text="", data={}, raw="timeout")
+    r = stages._implement_escalation(res, "/w")
+    assert "time limit" in r
+
+
+def test_implement_escalation_lists_uncommitted_work(monkeypatch):
+    # The key signal: the agent wrote a feature but never reported `done`, so the
+    # work is sitting uncommitted. The human must be told what's there.
+    monkeypatch.setattr(stages.repo, "dirty_files",
+                        lambda path: ["orchestrator/instructions.py",
+                                      "tests/test_instructions.py"])
+    res = RunResult(ok=True, text="", data={"status": "needs_human"})
+    r = stages._implement_escalation(res, "/w")
+    assert "2 uncommitted file(s)" in r
+    assert "orchestrator/instructions.py" in r
+
+
+def test_implement_escalation_truncates_a_long_file_list(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files",
+                        lambda path: [f"f{i}.py" for i in range(25)])
+    r = stages._implement_escalation(RunResult(ok=True, text="", data={}), "/w")
+    assert "…and 5 more" in r
+
+
+def test_implement_escalation_includes_the_models_reason(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=True, text="x",
+                    data={"status": "needs_human", "reason": "Spec is ambiguous."})
+    r = stages._implement_escalation(res, "/w")
+    assert "Spec is ambiguous." in r
+
+
+def test_implement_escalation_falls_back_when_nothing_known(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    r = stages._implement_escalation(RunResult(ok=True, text="", data={}), "/w")
+    assert r == "Implementation hit a blocker."
+
+
 def test_pause_records_comment_baseline(monkeypatch):
     posted = {}
 

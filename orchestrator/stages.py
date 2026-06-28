@@ -60,6 +60,30 @@ def _failure_reason(res, default):
     return default
 
 
+def _implement_escalation(res, path):
+    """A precise reason when an implement/fix run didn't report `done`. Tells the
+    human *how* it failed: a timed-out / crashed process vs. an agent that wrote
+    code but never emitted its result block — and lists the uncommitted files it
+    left in the checkout so the work isn't silently stranded."""
+    parts = []
+    if not res.ok:
+        parts.append("The implement run did not finish cleanly" + (
+            " — it hit the time limit." if (res.raw or "").strip() == "timeout"
+            else " — the agent process exited with an error."))
+    changed = repo.dirty_files(path)
+    if changed:
+        shown = "\n".join(f"- `{f}`" for f in changed[:20])
+        more = f"\n…and {len(changed) - 20} more" if len(changed) > 20 else ""
+        parts.append(
+            f"It left **{len(changed)} uncommitted file(s)** in the work checkout — "
+            f"it changed code but never reported `done`, so nothing was committed or "
+            f"pushed:\n{shown}{more}")
+    detail = _failure_reason(res, "")
+    if detail:
+        parts.append(detail)
+    return "\n\n".join(parts) or "Implementation hit a blocker."
+
+
 def _discussion(gh, n, issue=None, pr_number=None):
     """The full discussion a stage should weigh: the issue description and every
     issue comment, plus the PR description and its conversation + inline review
@@ -327,8 +351,9 @@ def handle_implement(gh, ledger, issue):
     log(f"[#{n}] implement: {'fix round ' + str(rnd) if rnd else 'first pass'}")
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
     if res.data.get("status") != "done":
-        log(f"[#{n}] implement: not done -> escalate (human:needed)")
-        _pause(gh, n, _failure_reason(res, "Implementation hit a blocker."))
+        log(f"[#{n}] implement: not done (ok={res.ok}, "
+            f"dirty={len(repo.dirty_files(path))}) -> escalate (human:needed)")
+        _pause(gh, n, _implement_escalation(res, path))
         return
     repo.commit_all(path, f"implement #{n}" + (f" (fix round {rnd})" if rnd else ""))
     repo.push(path, meta["branch"])

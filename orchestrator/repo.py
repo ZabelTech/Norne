@@ -48,6 +48,13 @@ def write_specs(path, n, specs):
     commit_all(path, f"specs for #{n}")
 
 
+def dirty_files(path):
+    """Paths with uncommitted changes (git porcelain) — the work an agent left
+    behind in the checkout when it stopped before we committed."""
+    out = _git(["status", "--porcelain"], path).stdout.strip()
+    return [ln[3:] for ln in out.splitlines() if ln.strip()] if out else []
+
+
 def commit_all(path, msg):
     _git(["add", "-A"], path)
     # commit only if there's something staged
