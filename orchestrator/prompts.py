@@ -47,6 +47,10 @@ FULL DISCUSSION — the issue description and every comment ((bot) lines are
 prior pipeline output; (human) lines are the source of truth):
 <<<DISCUSSION>>>
 
+PRIOR DRAFT & PEER-REVIEW FEEDBACK — if present, REVISE your specs to resolve
+every concern below ("(none)" on the first pass):
+<<<FEEDBACK>>>
+
 Repo context is in the current directory (read what you need; do NOT edit code).
 For each spec: a short title, a url-safe slug, a markdown body (context,
 approach, acceptance criteria, test plan), and a list of small, independently

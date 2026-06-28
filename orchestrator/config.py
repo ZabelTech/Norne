@@ -24,6 +24,7 @@ GLM_TIER = os.environ.get("GLM_TIER", "lite")          # lite | pro | max
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 AUTO_MERGE = _b("AUTO_MERGE")
 MAX_REVIEW_ROUNDS = int(os.environ.get("MAX_REVIEW_ROUNDS", "3"))
+MAX_SPEC_ROUNDS = int(os.environ.get("MAX_SPEC_ROUNDS", "3"))   # author<->reviewer spec loop
 TRIGGER_LABEL = os.environ.get("TRIGGER_LABEL", "pipeline")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")

@@ -62,6 +62,18 @@ class GitHub:
     def get_issue(self, n):
         return self._get(f"/issues/{n}")
 
+    def create_issue(self, title, body):
+        r = self.s.post(self._u("/issues"), json={"title": title, "body": body})
+        r.raise_for_status()
+        return r.json()
+
+    def add_sub_issue(self, parent_number, sub_issue_id):
+        """Link an existing issue (by its numeric id) as a sub-issue of parent."""
+        r = self.s.post(self._u(f"/issues/{parent_number}/sub_issues"),
+                        json={"sub_issue_id": sub_issue_id})
+        r.raise_for_status()
+        return r.json()
+
     def labels_of(self, issue):
         return {l["name"] for l in issue.get("labels", [])}
 

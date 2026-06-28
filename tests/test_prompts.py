@@ -70,6 +70,13 @@ def test_context_carrying_templates_have_a_discussion_slot():
         assert "<<<DISCUSSION>>>" in tpl
 
 
+def test_spec_template_has_feedback_slot_for_the_loop():
+    assert "<<<FEEDBACK>>>" in prompts.SPEC
+    out = prompts.render(prompts.SPEC, NUM=1, TITLE="T", SUMMARY="S",
+                         DISCUSSION="D", FEEDBACK="(none)")
+    assert "<<<" not in out
+
+
 def test_every_stage_template_ends_with_a_json_contract():
     for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
                 prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):

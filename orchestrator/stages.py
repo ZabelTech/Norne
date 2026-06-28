@@ -121,6 +121,11 @@ def handle_clarify(gh, ledger, issue):
 
 
 def handle_spec(gh, ledger, issue):
+    """Author the spec(s), then loop: a DIFFERENT family peer-reviews, and the
+    author revises against the concerns — up to MAX_SPEC_ROUNDS. When the
+    reviewer is happy, publish (sub-issues + branch -> implement). If the author
+    hits a judgement call, or the loop can't converge, escalate to a human —
+    posting the proposed specs as sub-issues either way."""
     n = issue["number"]
     path = repo.ensure_repo(n)
     summary = _last_bot_summary(gh, n)
@@ -128,27 +133,77 @@ def handle_spec(gh, ledger, issue):
     if guidance:
         summary += f"\n\nHUMAN GUIDANCE:\n{guidance}"
     discussion = _discussion(gh, n, issue=issue)
-    fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
-                    TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion), cwd=path)
-    d = res.data
-    if d.get("status") != "ready" or not d.get("specs"):
-        _pause(gh, n, d.get("reason") or "Spec generation needs input.")
-        return
-    specs = d["specs"]
-    # diversity-of-thought: a different family reviews the spec
-    _, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                  SPECS=_specs_text(specs), DISCUSSION=discussion),
-                  cwd=path, exclude_family=fam)
-    concerns = rev.data.get("concerns") or []
-    if rev.data.get("verdict") == "concerns" and concerns:
-        _pause(gh, n, "Spec review raised concerns:\n" +
-               "\n".join(f"- {c}" for c in concerns))
+
+    specs, concerns, feedback = None, [], "(none)"
+    for rnd in range(1, config.MAX_SPEC_ROUNDS + 1):
+        fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
+                        TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
+                        FEEDBACK=feedback), cwd=path)
+        d = res.data
+        if d.get("status") != "ready" or not d.get("specs"):
+            # the author itself hit a judgement call it should not make alone
+            _escalate_spec(gh, n, d.get("specs"),
+                           d.get("reason") or "Spec generation needs input.")
+            return
+        specs = d["specs"]
+        # diversity-of-thought: a DIFFERENT family peer-reviews the specs
+        _, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
+                      SPECS=_specs_text(specs), DISCUSSION=discussion),
+                      cwd=path, exclude_family=fam)
+        concerns = rev.data.get("concerns") or []
+        if rev.data.get("verdict") != "concerns" or not concerns:
+            _publish_specs(gh, n, path, specs)         # reviewer happy
+            return
+        # loop: hand the draft + concerns back to the author to revise
+        feedback = (f"YOUR PREVIOUS DRAFT:\n{_specs_text(specs)}\n\n"
+                    f"PEER-REVIEW CONCERNS (round {rnd}) to resolve:\n"
+                    + "\n".join(f"- {c}" for c in concerns))
+    # exhausted the loop without convergence -> human judgement call
+    _escalate_spec(gh, n, specs,
+                   f"Spec review still has concerns after {config.MAX_SPEC_ROUNDS} "
+                   "rounds — your call:\n" + "\n".join(f"- {c}" for c in concerns))
+
+
+def _spec_sub_issues(gh, n, specs):
+    """Post each spec as a sub-issue of #n (once). Best-effort; returns numbers."""
+    meta = issue_meta(n)
+    if meta.get("spec_sub_issues") is not None or not specs:
+        return meta.get("spec_sub_issues") or []
+    numbers = []
+    for s in specs:
+        items = "\n".join(f"- [ ] {wi.get('title','')}" for wi in s.get("work_items", []))
+        body = f"{s.get('body','')}\n\n## Work items\n{items}\n\n_Spec for #{n}._"
+        try:
+            child = gh.create_issue(s.get("title") or f"Spec for #{n}", body)
+            try:
+                gh.add_sub_issue(n, child["id"])       # link as a sub-issue
+            except Exception:
+                pass                                    # created; linking is best-effort
+            numbers.append(child["number"])
+        except Exception:
+            pass                                        # never let this break the stage
+    update_issue_meta(n, spec_sub_issues=numbers)
+    return numbers
+
+
+def _publish_specs(gh, n, path, specs):
+    """Reviewer is happy: post sub-issues, commit specs + branch, go implement."""
+    subs = _spec_sub_issues(gh, n, specs)
+    _commit_specs_and_branch(gh, n, path, specs, subs)
+
+
+def _escalate_spec(gh, n, specs, reason):
+    """Judgement call: post the proposed specs as sub-issues and pause for a human."""
+    subs = _spec_sub_issues(gh, n, specs)
+    if specs:
         update_issue_meta(n, pending_specs=specs)
-        return
-    _commit_specs_and_branch(gh, n, path, specs)
+    if subs:
+        reason += ("\n\nProposed specs posted as sub-issues: "
+                   + ", ".join(f"#{m}" for m in subs))
+    _pause(gh, n, reason)
 
 
-def _commit_specs_and_branch(gh, n, path, specs):
+def _commit_specs_and_branch(gh, n, path, specs, subs=None):
     base = gh.default_branch()
     branch = f"pipeline/issue-{n}"
     repo.checkout_branch(path, branch, base)
@@ -157,7 +212,8 @@ def _commit_specs_and_branch(gh, n, path, specs):
     update_issue_meta(n, branch=branch, specs=specs, review_round=0,
                       human_guidance=None, pending_specs=None)
     gh.set_flow(n, config.FLOW_IMPLEMENT, gh.get_issue(n))
-    gh.comment(n, f"🛠️ Spec'd into {len(specs)} spec(s) on `{branch}`. Implementing.")
+    sub_txt = (" Sub-issues: " + ", ".join(f"#{m}" for m in subs)) if subs else ""
+    gh.comment(n, f"🛠️ Spec'd into {len(specs)} spec(s) on `{branch}`.{sub_txt} Implementing.")
 
 
 def handle_implement(gh, ledger, issue):

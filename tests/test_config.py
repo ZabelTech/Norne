@@ -82,6 +82,10 @@ def test_review_runs_high_effort():
     assert config.EFFORT_BY_STAGE["review"] == "high"
 
 
+def test_spec_round_cap_is_a_positive_int():
+    assert isinstance(config.MAX_SPEC_ROUNDS, int) and config.MAX_SPEC_ROUNDS >= 1
+
+
 def test_effort_map_covers_every_stage():
     # Every routed stage needs an effort label for its bot-comment marker.
     assert set(config.EFFORT_BY_STAGE) == set(config.ROUTING)

@@ -71,3 +71,29 @@ def test_latest_human_comment_none_when_all_bot(monkeypatch):
     monkeypatch.setattr(gh, "list_comments",
                         lambda n: [_c(1, "draft\n\n`[norne-glm-4.7-low]`")])
     assert gh.latest_human_comment(7) is None
+
+
+def test_create_issue_and_add_sub_issue_hit_the_right_endpoints(monkeypatch):
+    gh = GitHub()
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"number": 7, "id": 555}
+
+    def fake_post(url, json=None, **kw):
+        calls.append((url, json))
+        return FakeResp()
+
+    monkeypatch.setattr(gh.s, "post", fake_post)
+    child = gh.create_issue("Title", "Body")
+    assert child == {"number": 7, "id": 555}
+    assert calls[-1][0].endswith("/issues")
+    assert calls[-1][1] == {"title": "Title", "body": "Body"}
+
+    gh.add_sub_issue(3, 555)
+    assert calls[-1][0].endswith("/issues/3/sub_issues")
+    assert calls[-1][1] == {"sub_issue_id": 555}

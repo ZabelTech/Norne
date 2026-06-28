@@ -185,3 +185,88 @@ def test_run_forwards_exclude_family(monkeypatch):
                         lambda fam: StubRunner("glm", RunResult(ok=True, text="")))
     stages._run("review", led, "P", cwd="/w", exclude_family="claude")
     assert captured["exclude"] == "claude"
+
+
+# ── spec author<->reviewer loop ──────────────────────────────────────────────
+def _R(data):
+    return RunResult(ok=True, text="", data=data)
+
+
+def _spec_env(monkeypatch, seq):
+    """Stub everything handle_spec touches except its loop/escalation logic."""
+    it = iter(seq)
+    monkeypatch.setattr(stages, "_run", lambda *a, **k: next(it))
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {})
+    out = {}
+    monkeypatch.setattr(stages, "_publish_specs",
+                        lambda gh, n, path, specs: out.update(published=specs))
+    monkeypatch.setattr(stages, "_escalate_spec",
+                        lambda gh, n, specs, reason: out.update(escalated=(specs, reason)))
+    return out
+
+
+def test_spec_publishes_when_reviewer_happy(monkeypatch):
+    out = _spec_env(monkeypatch, [
+        ("claude", _R({"status": "ready", "specs": [{"title": "A"}]})),
+        ("glm", _R({"verdict": "ok", "concerns": []})),
+    ])
+    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    assert out.get("published") == [{"title": "A"}]
+    assert "escalated" not in out
+
+
+def test_spec_loops_then_publishes_the_revised_specs(monkeypatch):
+    out = _spec_env(monkeypatch, [
+        ("claude", _R({"status": "ready", "specs": [{"title": "v1"}]})),  # author r1
+        ("glm", _R({"verdict": "concerns", "concerns": ["c1"]})),         # review r1
+        ("claude", _R({"status": "ready", "specs": [{"title": "v2"}]})),  # author r2 revises
+        ("glm", _R({"verdict": "ok", "concerns": []})),                   # review r2 happy
+    ])
+    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    assert out.get("published") == [{"title": "v2"}]   # the revised set, not v1
+
+
+def test_spec_escalates_after_max_rounds(monkeypatch):
+    monkeypatch.setattr(stages.config, "MAX_SPEC_ROUNDS", 2)
+    out = _spec_env(monkeypatch, [
+        ("claude", _R({"status": "ready", "specs": [{"title": "x"}]})),
+        ("glm", _R({"verdict": "concerns", "concerns": ["c"]})),
+        ("claude", _R({"status": "ready", "specs": [{"title": "x"}]})),
+        ("glm", _R({"verdict": "concerns", "concerns": ["c"]})),
+    ])
+    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    assert "escalated" in out and "published" not in out
+
+
+def test_spec_author_judgement_call_escalates(monkeypatch):
+    out = _spec_env(monkeypatch, [
+        ("claude", _R({"status": "needs_human", "reason": "ambiguous"})),
+    ])
+    stages.handle_spec(object(), None, {"number": 1, "title": "T"})
+    assert out["escalated"][1] == "ambiguous"
+
+
+def test_spec_sub_issues_creates_once_then_dedupes(monkeypatch):
+    created = []
+
+    class GH:
+        def create_issue(self, title, body):
+            created.append(title)
+            return {"number": 100 + len(created), "id": 9000 + len(created)}
+
+        def add_sub_issue(self, parent, sub_id):
+            pass
+
+    store = {}
+    monkeypatch.setattr(stages, "issue_meta", lambda n: store.get(n, {}))
+    monkeypatch.setattr(stages, "update_issue_meta",
+                        lambda n, **kw: store.setdefault(n, {}).update(kw))
+    specs = [{"title": "A", "work_items": [{"title": "wi"}]}, {"title": "B"}]
+    assert stages._spec_sub_issues(GH(), 1, specs) == [101, 102]
+    assert created == ["A", "B"]
+    # idempotent: a second call posts nothing new
+    assert stages._spec_sub_issues(GH(), 1, specs) == [101, 102]
+    assert created == ["A", "B"]
