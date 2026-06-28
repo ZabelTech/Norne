@@ -21,8 +21,11 @@ There is no human watching this session in real time.
   return `needs_human` with a clear `reason` rather than guessing.
 
 ## Project specifics
-<!-- Fill these in for your repo: -->
-- Test:  `# e.g. npm test`
-- Lint:  `# e.g. npm run lint`
-- Build: `# e.g. npm run build`
-- Conventions: `# e.g. conventional commits, src/ layout, etc.`
+This repo is the orchestrator itself (Python). When changing it:
+- Test:  `python3 -m pytest`  (unit tests live in `tests/`; no network/subprocess)
+- Lint:  *(none configured yet — keep imports clean and match surrounding style)*
+- Build: *(no build step — pure Python; `pip install -r requirements-dev.txt` for dev deps)*
+- Conventions: stdlib-first, small modules under `orchestrator/`, one concern per
+  file (see the "Where things live" map in `HANDOFF.md`). Add/extend tests in
+  `tests/` for any logic you touch; keep them hermetic (env is stubbed in
+  `tests/conftest.py`, no real GitHub/model calls).

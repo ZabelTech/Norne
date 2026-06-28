@@ -143,6 +143,22 @@ green-light the spec; add **`human:resolved`** after any judgement call.
   Claude stays in Claude Code and only GLM goes through Pi.
 - **Single writer.** Run exactly one Machine; the state machine assumes one.
 
+## Development / tests
+
+The orchestrator's pure logic — the budget ledger, the router, structured-output
+parsing, prompt rendering, and the route→run→meter path — is covered by a
+hermetic unit suite under `tests/` (no network, no model calls, no subprocesses;
+the environment is stubbed in `tests/conftest.py`).
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+CI runs the same suite on every push (`.github/workflows/tests.yml`). This is
+the cheap GitHub-Actions CI the design explicitly keeps separate from the
+subscription-driven agents on Fly.
+
 ## Extending
 
 - **Sub-issues instead of `specs/*.md`**: swap `repo.write_specs` + the spec
