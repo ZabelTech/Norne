@@ -13,6 +13,7 @@ primary_region = "ams"   # set to your nearest Fly region
   dockerfile = "Dockerfile"
 
 [env]
+  PYTHONUNBUFFERED = "1"        # flush orchestrator stdout to `fly logs` in real time
   POLL_INTERVAL = "30"          # seconds between GitHub polls
   GLM_RUNNER = "claude-code-zai"  # guaranteed-headless GLM (Claude Code -> z.ai); no-Claude box
   GLM_TIER = "lite"             # lite | pro | max  (sizes the GLM budget)
