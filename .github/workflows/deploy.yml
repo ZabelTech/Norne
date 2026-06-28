@@ -1,0 +1,43 @@
+name: deploy
+
+# Auto-deploy the orchestrator to Fly on every push to main (e.g. a merge).
+# Tests must pass first, and deploys are serialized — the Machine is a single
+# writer, so two overlapping deploys must never race.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python3 -m pytest
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy to Fly
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::warning::FLY_API_TOKEN secret not set — skipping deploy."
+            echo "Add a Fly deploy token as the FLY_API_TOKEN repo secret to enable auto-deploy."
+            exit 0
+          fi
+          # --ha=false keeps exactly one Machine (single-writer state machine).
+          flyctl deploy --remote-only --ha=false
