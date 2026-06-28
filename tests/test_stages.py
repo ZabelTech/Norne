@@ -204,6 +204,26 @@ def test_participant_notes_model_effort_and_tokens():
     assert "claude-opus-4-8" in p and "high" in p and "12ktok" in p
 
 
+def test_pause_records_comment_baseline(monkeypatch):
+    posted = {}
+
+    class GH:
+        def add_labels(self, n, names):
+            pass
+
+        def comment(self, n, body):
+            posted["body"] = body
+
+        def list_comments(self, n):
+            return [{"id": 7}, {"id": 42}]
+
+    store = {}
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: store.update(kw))
+    stages._pause(GH(), 1, "because")
+    assert store.get("last_comment_seen") == 42   # so a later comment is "fresh"
+    assert "because" in posted["body"]
+
+
 # ── spec author<->reviewer loop ──────────────────────────────────────────────
 def _R(data):
     return RunResult(ok=True, text="", data=data)

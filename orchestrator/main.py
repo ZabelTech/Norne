@@ -27,14 +27,18 @@ def process_issue(gh, ledger, issue):
         else:
             return
 
-    # Paused on a human judgement call — resume only after you say so.
+    # Paused on a human judgement call. Resume when you EITHER add the
+    # `human:resolved` label OR simply post a new comment — your latest comment
+    # becomes the guidance fed into the re-run (the next round).
     if config.FLAG_NEEDS_HUMAN in labels:
-        if config.SIG_RESOLVED in labels:
-            latest = gh.latest_human_comment(n)
+        latest = gh.latest_human_comment(n)
+        new_comment = bool(latest) and latest["id"] > issue_meta(n).get("last_comment_seen", 0)
+        if config.SIG_RESOLVED in labels or new_comment:
             if latest:
                 update_issue_meta(n, human_guidance=latest["body"])
             gh.remove_label(n, config.FLAG_NEEDS_HUMAN)
-            gh.remove_label(n, config.SIG_RESOLVED)
+            if config.SIG_RESOLVED in labels:
+                gh.remove_label(n, config.SIG_RESOLVED)
         else:
             return
 

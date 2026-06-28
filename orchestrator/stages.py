@@ -97,8 +97,12 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
 def _pause(gh, n, reason):
     gh.add_labels(n, [config.FLAG_NEEDS_HUMAN])
     gh.comment(n, f"⏸️ **Needs a human call.**\n\n{reason}\n\n"
-                  f"Reply with your decision, then add the `{config.SIG_RESOLVED}` "
-                  f"label to resume.")
+                  f"Just reply with your decision to resume (or add the "
+                  f"`{config.SIG_RESOLVED}` label).")
+    # Baseline: any comment you post AFTER this is detected as fresh input that
+    # resumes the paused stage — see process_issue's human:needed gate.
+    update_issue_meta(n, last_comment_seen=max(
+        (c["id"] for c in gh.list_comments(n)), default=0))
 
 
 # ── Stage handlers ─────────────────────────────────────────────────────────
