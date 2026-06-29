@@ -55,11 +55,13 @@ def parse_structured(text):
 
 
 def _run(cmd, cwd, env, pool):
+    """Run a model subprocess. Returns (proc, blob); on timeout returns
+    (None, "timeout") so callers can tell a wall-clock kill from a clean exit."""
     try:
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True,
                            text=True, timeout=DEFAULT_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return RunResult(ok=False, text="", raw="timeout")
+        return None, "timeout"
     blob = (p.stdout or "") + "\n" + (p.stderr or "")
     if p.returncode != 0 and _RL_HINT.search(blob):
         raise RateLimited(pool)
@@ -73,16 +75,25 @@ def _base_env():
     return env
 
 
-def _apply_effort(prompt, effort):
+# A code-writing stage (implement/fix) edits many files, writes tests, and runs
+# them — it needs far more turns than a read-and-reason stage. The effort knob
+# tunes how hard the model THINKS; this floor keeps a write stage from running
+# out of turns mid-feature (the failure that stranded issue #1's implement work).
+WRITE_TURN_FLOOR = 120
+
+
+def _apply_effort(prompt, effort, write=False):
     """Prepend the effort directive and return (prompt, max_turns).
 
     Prepended (not appended) so the prompt's trailing 'end with one json block'
-    instruction stays last.
+    instruction stays last. Code-writing stages get a turn floor so they don't
+    stop before reporting `done`.
     """
     t = config.effort_tuning(effort)
+    max_turns = max(t["max_turns"], WRITE_TURN_FLOOR) if write else t["max_turns"]
     if t["directive"]:
         prompt = f"{t['directive']}\n\n{prompt}"
-    return prompt, t["max_turns"]
+    return prompt, max_turns
 
 
 def _claude_cc_json(stdout):
@@ -107,12 +118,14 @@ class ClaudeCodeRunner:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = config.CLAUDE_CODE_OAUTH_TOKEN
         env.pop("ANTHROPIC_BASE_URL", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        prompt, max_turns = _apply_effort(prompt, effort)
+        prompt, max_turns = _apply_effort(prompt, effort, write=write)
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns)]
         if model:
             cmd += ["--model", model]
         res, blob = _run(cmd, cwd, env, "claude")
+        if res is None:                                   # timed out
+            return RunResult(ok=False, text="", raw=blob)
         text, itok, otok = _claude_cc_json(res.stdout)
         return RunResult(ok=res.returncode == 0, text=text, data=parse_structured(text),
                          input_tokens=itok, output_tokens=otok, raw=blob)
@@ -128,11 +141,13 @@ class GlmClaudeCodeRunner:
         env["ANTHROPIC_BASE_URL"] = config.ZAI_BASE_URL
         env["ANTHROPIC_AUTH_TOKEN"] = config.ZAI_AUTH_TOKEN
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-        prompt, max_turns = _apply_effort(prompt, effort)
+        prompt, max_turns = _apply_effort(prompt, effort, write=write)
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns),
                "--model", model]
         res, blob = _run(cmd, cwd, env, "glm")
+        if res is None:                                   # timed out
+            return RunResult(ok=False, text="", raw=blob)
         text, itok, otok = _claude_cc_json(res.stdout)
         return RunResult(ok=res.returncode == 0, text=text, data=parse_structured(text),
                          input_tokens=itok, output_tokens=otok, raw=blob)

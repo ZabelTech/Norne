@@ -81,9 +81,17 @@ End with exactly one json block:
             "work_items": [{"title": "...", "body": "..."}]}]}
 ```"""
 
-SPEC_REVIEW = """Critically review these specs for a different perspective.
-You did NOT write them. Look for: missing acceptance criteria, infeasible or
-risky steps, scope creep, untested edge cases, wrong assumptions.
+SPEC_REVIEW = """Review these specs for a different perspective — you did NOT
+write them. Raise ONLY material, blocking problems: things that would actually
+produce a wrong, infeasible, or unimplementable spec (missing/incorrect
+acceptance criteria, infeasible or risky steps, real scope creep, wrong
+assumptions, a critical untested edge case). Do NOT raise nitpicks, wording or
+style preferences, or optional "nice-to-have" improvements.
+
+If you are MOSTLY satisfied overall, return verdict "ok" and STOP — a few minor,
+non-blocking imperfections are fine and must NOT hold up approval. Return
+"concerns" only when there is at least one genuinely blocking problem, and list
+just those (be concise).
 
 <<<INSTRUCTIONS>>>
 
@@ -103,7 +111,7 @@ against what was actually asked):
 End with exactly one json block:
 ```json
 {"verdict": "ok" | "concerns",
- "concerns": ["<specific, actionable>"]}
+ "concerns": ["<only genuinely blocking problems>"]}
 ```"""
 
 IMPLEMENT = """Implement the spec(s) for issue #<<<NUM>>> in the current branch.

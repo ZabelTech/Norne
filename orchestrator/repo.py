@@ -1,5 +1,4 @@
 """Git working-copy helpers. One persistent checkout per issue on the volume."""
-import math
 import os
 import subprocess
 from . import config
@@ -36,16 +35,25 @@ def checkout_branch(path, branch, base):
         _git(["pull", "origin", branch], path)
 
 
-def write_specs(path, n, specs):
+def write_spec(path, n, spec, idx=0):
+    """Write ONE spec under specs/<n>/<slug>.md and commit it — each spec lives on
+    its own branch, so the branch carries only its own spec file. Returns the slug."""
     d = os.path.join(path, "specs", str(n))
     os.makedirs(d, exist_ok=True)
-    for s in specs:
-        slug = s.get("slug") or f"spec-{specs.index(s)+1}"
-        body = s.get("body", "")
-        items = "\n".join(f"- [ ] {wi.get('title','')}" for wi in s.get("work_items", []))
-        with open(os.path.join(d, f"{slug}.md"), "w") as f:
-            f.write(f"# {s.get('title','')}\n\n{body}\n\n## Work items\n{items}\n")
-    commit_all(path, f"specs for #{n}")
+    slug = spec.get("slug") or f"spec-{idx + 1}"
+    body = spec.get("body", "")
+    items = "\n".join(f"- [ ] {wi.get('title','')}" for wi in spec.get("work_items", []))
+    with open(os.path.join(d, f"{slug}.md"), "w") as f:
+        f.write(f"# {spec.get('title','')}\n\n{body}\n\n## Work items\n{items}\n")
+    commit_all(path, f"spec '{slug}' for #{n}")
+    return slug
+
+
+def dirty_files(path):
+    """Paths with uncommitted changes (git porcelain) — the work an agent left
+    behind in the checkout when it stopped before we committed."""
+    out = _git(["status", "--porcelain"], path).stdout.strip()
+    return [ln[3:] for ln in out.splitlines() if ln.strip()] if out else []
 
 
 def commit_all(path, msg):

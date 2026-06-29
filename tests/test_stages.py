@@ -225,6 +225,46 @@ def test_failure_reason_falls_back_to_default_when_nothing_useful():
         RunResult(ok=True, text="x", data={"status": "weird"}), "DEF") == "DEF"
 
 
+def test_implement_escalation_reports_a_timeout(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=False, text="", data={}, raw="timeout")
+    r = stages._implement_escalation(res, "/w")
+    assert "time limit" in r
+
+
+def test_implement_escalation_lists_uncommitted_work(monkeypatch):
+    # The key signal: the agent wrote a feature but never reported `done`, so the
+    # work is sitting uncommitted. The human must be told what's there.
+    monkeypatch.setattr(stages.repo, "dirty_files",
+                        lambda path: ["orchestrator/instructions.py",
+                                      "tests/test_instructions.py"])
+    res = RunResult(ok=True, text="", data={"status": "needs_human"})
+    r = stages._implement_escalation(res, "/w")
+    assert "2 uncommitted file(s)" in r
+    assert "orchestrator/instructions.py" in r
+
+
+def test_implement_escalation_truncates_a_long_file_list(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files",
+                        lambda path: [f"f{i}.py" for i in range(25)])
+    r = stages._implement_escalation(RunResult(ok=True, text="", data={}), "/w")
+    assert "…and 5 more" in r
+
+
+def test_implement_escalation_includes_the_models_reason(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=True, text="x",
+                    data={"status": "needs_human", "reason": "Spec is ambiguous."})
+    r = stages._implement_escalation(res, "/w")
+    assert "Spec is ambiguous." in r
+
+
+def test_implement_escalation_falls_back_when_nothing_known(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    r = stages._implement_escalation(RunResult(ok=True, text="", data={}), "/w")
+    assert r == "Implementation hit a blocker."
+
+
 def test_pause_records_comment_baseline(monkeypatch):
     posted = {}
 
@@ -366,24 +406,162 @@ def test_spec_parse_failure_surfaces_the_agents_message(monkeypatch):
     assert "output didn't parse" in out["note"]           # round note distinguishes it
 
 
-def test_spec_sub_issues_creates_once_then_dedupes(monkeypatch):
-    created = []
+# ── per-spec fan-out: branch + PR per spec, issue closes when all merge ───────
+class _FanGH:
+    """Records the GitHub calls the per-spec handlers make, with enough behaviour
+    to drive a unit through implement -> review -> merge -> close."""
+    def __init__(self, default="main", pulls=None):
+        self.default = default
+        self.flow = None
+        self.comments = []
+        self.created_pulls = []
+        self.merged = []
+        self.closed = []
+        self._pulls = pulls or {}                 # branch -> existing PR (or none)
+        self._by_number = {}
 
-    class GH:
-        def create_issue(self, title, body):
-            created.append(title)
-            return {"number": 100 + len(created), "id": 9000 + len(created)}
+    def default_branch(self):
+        return self.default
 
-        def add_sub_issue(self, parent, sub_id):
-            pass
+    def get_issue(self, n):
+        return {"number": n, "title": "T"}
 
+    def set_flow(self, n, flow, issue=None):
+        self.flow = flow
+
+    def comment(self, n, body, **k):
+        self.comments.append(body)
+
+    def pull_for_branch(self, branch):
+        return self._pulls.get(branch)
+
+    def create_pull(self, title, head, base, body):
+        pr = {"number": 200 + len(self.created_pulls), "title": title,
+              "head": head, "base": base, "body": body}
+        self.created_pulls.append(pr)
+        self._by_number[pr["number"]] = pr
+        return pr
+
+    def get_pull(self, number):
+        return self._by_number.get(number, {"number": number})
+
+    def merge_pull(self, number, method="squash"):
+        self.merged.append(number)
+
+    def close_issue(self, n):
+        self.closed.append(n)
+
+
+def _two_specs():
+    return [{"title": "Spec A", "slug": "a", "body": "ba", "work_items": []},
+            {"title": "Spec B", "slug": "b", "body": "bb", "work_items": []}]
+
+
+def test_publish_specs_makes_a_branch_per_spec_no_sub_issues(monkeypatch):
+    branches, written = [], []
+    monkeypatch.setattr(stages.repo, "checkout_branch",
+                        lambda path, branch, base: branches.append(branch))
+    monkeypatch.setattr(stages.repo, "write_spec",
+                        lambda path, n, s, i: written.append(s["slug"]) or s["slug"])
+    monkeypatch.setattr(stages.repo, "push", lambda path, branch: None)
     store = {}
-    monkeypatch.setattr(stages, "issue_meta", lambda n: store.get(n, {}))
     monkeypatch.setattr(stages, "update_issue_meta",
-                        lambda n, **kw: store.setdefault(n, {}).update(kw))
-    specs = [{"title": "A", "work_items": [{"title": "wi"}]}, {"title": "B"}]
-    assert stages._spec_sub_issues(GH(), 1, specs) == [101, 102]
-    assert created == ["A", "B"]
-    # idempotent: a second call posts nothing new
-    assert stages._spec_sub_issues(GH(), 1, specs) == [101, 102]
-    assert created == ["A", "B"]
+                        lambda n, **kw: store.update(kw))
+    gh = _FanGH()
+    stages._publish_specs(gh, 1, "/p", _two_specs())
+    assert branches == ["pipeline/issue-1/a", "pipeline/issue-1/b"]
+    assert written == ["a", "b"]
+    units = store["spec_units"]
+    assert [u["branch"] for u in units] == \
+        ["pipeline/issue-1/a", "pipeline/issue-1/b"]
+    assert all(u["stage"] == "implement" for u in units)
+    assert gh.flow == stages.config.FLOW_IMPLEMENT
+    assert gh.closed == []                              # no sub-issues created/closed
+
+
+def test_units_migrates_a_legacy_single_branch_issue():
+    meta = {"branch": "pipeline/issue-9", "specs": [{"title": "Old", "slug": "old"}],
+            "pr_number": 42, "review_round": 1, "implementer": "glm"}
+    units = stages._units(meta)
+    assert len(units) == 1
+    u = units[0]
+    assert u["branch"] == "pipeline/issue-9" and u["pr_number"] == 42
+    assert u["stage"] == "review"                       # has a PR -> mid-review
+    assert u["implementer"] == "glm" and u["review_round"] == 1
+
+
+def test_implement_opens_pr_linking_issue_without_closing(monkeypatch):
+    units = [{"slug": "a", "title": "Spec A", "branch": "pipeline/issue-1/a",
+              "spec": _two_specs()[0], "stage": "implement", "pr_number": None,
+              "review_round": 0, "last_feedback": None, "implementer": None}]
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    saved = {}
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "checkout_branch", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "push", lambda *a: None)
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_run", lambda *a, **k:
+                        ("glm", RunResult(ok=True, text="",
+                                          data={"status": "done", "summary": "did it"})))
+    gh = _FanGH()
+    stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+    pr = gh.created_pulls[0]
+    assert "Part of #1" in pr["body"] and "Closes #1" not in pr["body"]
+    assert pr["head"] == "pipeline/issue-1/a"
+    assert saved["spec_units"][0]["stage"] == "review"
+    assert saved["spec_units"][0]["pr_number"] == pr["number"]
+    assert gh.flow == stages.config.FLOW_REVIEW          # only unit -> review next
+
+
+def test_merge_closes_issue_only_when_every_pr_is_merged(monkeypatch):
+    units = [
+        {"slug": "a", "branch": "b/a", "spec": {}, "stage": "merge", "pr_number": 201,
+         "title": "A", "review_round": 0, "last_feedback": None, "implementer": "glm"},
+        {"slug": "b", "branch": "b/b", "spec": {}, "stage": "merge", "pr_number": 202,
+         "title": "B", "review_round": 0, "last_feedback": None, "implementer": "glm"},
+    ]
+    saved = {}
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
+    monkeypatch.setattr(stages.config, "AUTO_MERGE", False)
+
+    # First tick: only PR 201 is merged -> issue stays open.
+    gh = _FanGH()
+    gh._by_number = {201: {"number": 201, "merged": True},
+                     202: {"number": 202, "merged": False}}
+    stages.handle_merge(gh, None, {"number": 1, "title": "T"})
+    assert gh.closed == []                               # one still open
+    assert saved["spec_units"][0]["stage"] == "done"
+    assert saved["spec_units"][1]["stage"] == "merge"
+
+    # Second tick: 202 now merged too -> close the issue.
+    gh2 = _FanGH()
+    gh2._by_number = {201: {"number": 201, "merged": True},
+                      202: {"number": 202, "merged": True}}
+    units2 = saved["spec_units"]
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units2})
+    stages.handle_merge(gh2, None, {"number": 1, "title": "T"})
+    assert gh2.closed == [1]
+    assert gh2.flow == stages.config.FLOW_DONE
+
+
+def test_review_approve_moves_unit_to_merge(monkeypatch):
+    units = [{"slug": "a", "title": "A", "branch": "b/a", "spec": _two_specs()[0],
+              "stage": "review", "pr_number": 201, "review_round": 0,
+              "last_feedback": None, "implementer": "glm"}]
+    saved = {}
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "checkout_branch", lambda *a: None)
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
+    monkeypatch.setattr(stages, "_run", lambda *a, **k:
+                        ("claude", RunResult(ok=True, text="",
+                                             data={"status": "approve", "summary": "ok"})))
+    gh = _FanGH()
+    stages.handle_review(gh, None, {"number": 1, "title": "T"})
+    assert saved["spec_units"][0]["stage"] == "merge"
+    assert gh.flow == stages.config.FLOW_MERGE

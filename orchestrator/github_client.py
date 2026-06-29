@@ -74,6 +74,12 @@ class GitHub:
         r.raise_for_status()
         return r.json()
 
+    def close_issue(self, n):
+        """Close an issue (used once every spec PR for it has merged)."""
+        r = self.s.patch(self._u(f"/issues/{n}"), json={"state": "closed"})
+        r.raise_for_status()
+        return r.json()
+
     def labels_of(self, issue):
         return {l["name"] for l in issue.get("labels", [])}
 
