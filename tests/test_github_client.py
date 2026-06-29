@@ -97,3 +97,25 @@ def test_create_issue_and_add_sub_issue_hit_the_right_endpoints(monkeypatch):
     gh.add_sub_issue(3, 555)
     assert calls[-1][0].endswith("/issues/3/sub_issues")
     assert calls[-1][1] == {"sub_issue_id": 555}
+
+
+def test_close_issue_patches_state_closed(monkeypatch):
+    gh = GitHub()
+    calls = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"number": 9, "state": "closed"}
+
+    def fake_patch(url, json=None, **kw):
+        calls.append((url, json))
+        return FakeResp()
+
+    monkeypatch.setattr(gh.s, "patch", fake_patch)
+    out = gh.close_issue(9)
+    assert out["state"] == "closed"
+    assert calls[-1][0].endswith("/issues/9")
+    assert calls[-1][1] == {"state": "closed"}

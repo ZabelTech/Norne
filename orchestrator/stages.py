@@ -201,7 +201,7 @@ def handle_clarify(gh, ledger, issue):
 def handle_spec(gh, ledger, issue):
     """ONE author->peer-review round per tick (cross-tick loop). On concerns it
     checkpoints the feedback in meta and stays at flow:spec to revise on the next
-    tick; a clean verdict publishes (sub-issues + branch -> implement); reaching
+    tick; a clean verdict publishes (a branch per spec -> implement); reaching
     MAX_SPEC_ROUNDS without convergence escalates to a human. Running one round
     per tick (not all rounds inline) keeps the worker free between rounds so the
     orchestrator stays responsive and a paused issue can resume promptly."""
@@ -279,157 +279,222 @@ def _reset_spec_loop(n):
     update_issue_meta(n, spec_round=0, spec_feedback=None)
 
 
-def _spec_sub_issues(gh, n, specs):
-    """Post each spec as a sub-issue of #n (once). Best-effort; returns numbers."""
-    meta = issue_meta(n)
-    if meta.get("spec_sub_issues") is not None or not specs:
-        return meta.get("spec_sub_issues") or []
-    numbers = []
-    for s in specs:
-        items = "\n".join(f"- [ ] {wi.get('title','')}" for wi in s.get("work_items", []))
-        body = f"{s.get('body','')}\n\n## Work items\n{items}\n\n_Spec for #{n}._"
-        try:
-            child = gh.create_issue(s.get("title") or f"Spec for #{n}", body)
-            try:
-                gh.add_sub_issue(n, child["id"])       # link as a sub-issue
-            except Exception:
-                pass                                    # created; linking is best-effort
-            numbers.append(child["number"])
-        except Exception:
-            pass                                        # never let this break the stage
-    update_issue_meta(n, spec_sub_issues=numbers)
-    return numbers
+def _slug(spec, idx):
+    return spec.get("slug") or f"spec-{idx + 1}"
+
+
+_FLOW_STAGE = {"implement": "implement", "review": "review", "merge": "merge"}
+
+
+def _units(meta, flow=None):
+    """The per-spec work units. Each is one spec on its own branch, carried through
+    implement -> review -> merge independently:
+        {slug, title, branch, spec, stage, pr_number, review_round,
+         last_feedback, implementer}
+    stage ∈ {implement, review, merge, done}. Migrates a legacy single-branch
+    issue (pre per-spec fan-out) into one unit on first read so in-flight work
+    keeps moving — placing the unit at the stage matching the issue's current flow
+    label (passed in by the handler), falling back to a PR-presence heuristic."""
+    units = meta.get("spec_units")
+    if units:
+        return units
+    specs = meta.get("specs") or []
+    branch = meta.get("branch")
+    if not (specs and branch):
+        return []
+    stage = _FLOW_STAGE.get(flow) or \
+        ("review" if meta.get("pr_number") else "implement")
+    return [{
+        "slug": _slug(specs[0], 0), "title": specs[0].get("title", ""),
+        "branch": branch, "spec": specs[0], "stage": stage,
+        "pr_number": meta.get("pr_number"), "review_round": meta.get("review_round", 0),
+        "last_feedback": meta.get("last_feedback"), "implementer": meta.get("implementer"),
+    }]
+
+
+def _save_units(n, units):
+    update_issue_meta(n, spec_units=units)
+
+
+def _advance(gh, n, units, issue=None):
+    """Set the issue's aggregate flow from the per-unit stages — implement until
+    every spec has an open PR, then review, then merge — and close the issue once
+    every spec PR is merged."""
+    if any(u["stage"] == "implement" for u in units):
+        gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
+    elif any(u["stage"] == "review" for u in units):
+        gh.set_flow(n, config.FLOW_REVIEW, issue)
+    elif any(u["stage"] != "done" for u in units):       # approved, waiting to merge
+        gh.set_flow(n, config.FLOW_MERGE, issue)
+    else:                                                 # all spec PRs merged
+        gh.comment(n, f"🎉 All {len(units)} spec PR(s) merged. Closing #{n}.")
+        gh.set_flow(n, config.FLOW_DONE, issue)
+        gh.close_issue(n)
+        log(f"[#{n}] all {len(units)} spec PR(s) merged -> closed, flow:done")
 
 
 def _publish_specs(gh, n, path, specs, round_note=""):
-    """Reviewer is happy: post sub-issues, commit specs + branch, go implement."""
-    subs = _spec_sub_issues(gh, n, specs)
-    _commit_specs_and_branch(gh, n, path, specs, subs, round_note)
-
-
-def _escalate_spec(gh, n, specs, reason, round_note=""):
-    """Judgement call: post the proposed specs as sub-issues and pause for a human."""
-    subs = _spec_sub_issues(gh, n, specs)
-    if specs:
-        update_issue_meta(n, pending_specs=specs)
-    if subs:
-        reason += ("\n\nProposed specs posted as sub-issues: "
-                   + ", ".join(f"#{m}" for m in subs))
-    if round_note:
-        reason += f"\n\n{round_note}"
-    _pause(gh, n, reason)
-
-
-def _commit_specs_and_branch(gh, n, path, specs, subs=None, round_note=""):
+    """Reviewer is happy: give each spec its OWN branch with just that spec
+    committed (no sub-issues), then move to implement."""
     base = gh.default_branch()
-    branch = f"pipeline/issue-{n}"
-    repo.checkout_branch(path, branch, base)
-    repo.write_specs(path, n, specs)
-    repo.push(path, branch)
-    update_issue_meta(n, branch=branch, specs=specs, review_round=0,
-                      human_guidance=None, pending_specs=None)
+    units = []
+    for i, s in enumerate(specs):
+        slug = _slug(s, i)
+        branch = f"pipeline/issue-{n}/{slug}"
+        repo.checkout_branch(path, branch, base)
+        repo.write_spec(path, n, s, i)
+        repo.push(path, branch)
+        units.append({"slug": slug, "title": s.get("title", ""), "branch": branch,
+                      "spec": s, "stage": "implement", "pr_number": None,
+                      "review_round": 0, "last_feedback": None, "implementer": None})
+    update_issue_meta(n, spec_units=units, specs=specs, branch=None,
+                      review_round=0, human_guidance=None, pending_specs=None)
     gh.set_flow(n, config.FLOW_IMPLEMENT, gh.get_issue(n))
-    sub_txt = (" Sub-issues: " + ", ".join(f"#{m}" for m in subs)) if subs else ""
-    body = f"🛠️ Spec'd into {len(specs)} spec(s) on `{branch}`.{sub_txt} Implementing."
+    lines = "\n".join(f"- `{u['branch']}` — {u['title']}" for u in units)
+    body = (f"🛠️ Spec'd into {len(units)} spec(s), one branch each:\n{lines}\n\n"
+            "Implementing each on its own branch; the issue closes when every PR merges.")
     if round_note:
         body += f"\n\n{round_note}"
     gh.comment(n, body)
 
 
+def _escalate_spec(gh, n, specs, reason, round_note=""):
+    """Judgement call before publish: keep the proposed specs in meta and pause for
+    a human (no sub-issues — the specs become branches only once approved)."""
+    if specs:
+        update_issue_meta(n, pending_specs=specs)
+        titles = "\n".join(f"- {s.get('title', '(untitled)')}" for s in specs)
+        reason += f"\n\nProposed specs:\n{titles}"
+    if round_note:
+        reason += f"\n\n{round_note}"
+    _pause(gh, n, reason)
+
+
 def handle_implement(gh, ledger, issue):
+    """Implement the next spec that still needs code (or a fix round), on its own
+    branch, and open a PR linking the issue. One spec per tick."""
     n = issue["number"]
-    meta = issue_meta(n)
+    units = _units(issue_meta(n), "implement")
+    u = next((x for x in units if x["stage"] == "implement"), None)
+    if u is None:                                        # nothing left to implement
+        _advance(gh, n, units, issue)
+        return
     path = repo.ensure_repo(n)
-    repo.checkout_branch(path, meta["branch"], gh.default_branch())
-    rnd = meta.get("review_round", 0)
-    discussion = _discussion(gh, n, issue=issue, pr_number=meta.get("pr_number"))
-    if rnd > 0 and meta.get("last_feedback"):           # fix iteration
+    repo.checkout_branch(path, u["branch"], gh.default_branch())
+    rnd = u.get("review_round", 0)
+    discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
+    if rnd > 0 and u.get("last_feedback"):              # fix iteration
         prompt = prompts.render(prompts.FIX, NUM=n, ROUND=rnd,
-                                FEEDBACK=meta["last_feedback"], DISCUSSION=discussion)
+                                FEEDBACK=u["last_feedback"], DISCUSSION=discussion)
     else:
         prompt = prompts.render(prompts.IMPLEMENT, NUM=n, DISCUSSION=discussion)
-    log(f"[#{n}] implement: {'fix round ' + str(rnd) if rnd else 'first pass'}")
+    log(f"[#{n}] implement {u['slug']}: "
+        f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
     if res.data.get("status") != "done":
-        log(f"[#{n}] implement: not done (ok={res.ok}, "
+        log(f"[#{n}] implement {u['slug']}: not done (ok={res.ok}, "
             f"dirty={len(repo.dirty_files(path))}) -> escalate (human:needed)")
         _pause(gh, n, _implement_escalation(res, path))
         return
-    repo.commit_all(path, f"implement #{n}" + (f" (fix round {rnd})" if rnd else ""))
-    repo.push(path, meta["branch"])
-    pr = gh.pull_for_branch(meta["branch"])
+    repo.commit_all(path, f"implement #{n} {u['slug']}"
+                    + (f" (fix round {rnd})" if rnd else ""))
+    repo.push(path, u["branch"])
+    pr = gh.pull_for_branch(u["branch"])
     if not pr:
-        body = (f"{res.data.get('summary','')}\n\nCloses #{n}\n\n"
-                f"_Specs: `specs/{n}/`. Implemented by **{fam}**._")
-        pr = gh.create_pull(title=issue["title"], head=meta["branch"],
+        # "Part of #n" links the issue WITHOUT auto-closing it on merge — the issue
+        # closes only once every spec PR has merged (see _advance).
+        body = (f"{res.data.get('summary','')}\n\nPart of #{n}\n\n"
+                f"_Spec: `specs/{n}/{u['slug']}.md`. Implemented by **{fam}**._")
+        pr = gh.create_pull(title=f"{issue['title']} — {u['title']}", head=u["branch"],
                             base=gh.default_branch(), body=body)
-    update_issue_meta(n, pr_number=pr["number"], implementer=fam)
-    gh.set_flow(n, config.FLOW_REVIEW, issue)
-    log(f"[#{n}] implement: done by {fam} -> PR #{pr['number']}, flow:review")
+    u["pr_number"], u["implementer"], u["stage"] = pr["number"], fam, "review"
+    _save_units(n, units)
+    log(f"[#{n}] implement {u['slug']}: done by {fam} -> PR #{pr['number']}")
+    _advance(gh, n, units, issue)
 
 
 def handle_review(gh, ledger, issue):
+    """Review the next spec PR awaiting review, cross-model. One spec per tick."""
     n = issue["number"]
-    meta = issue_meta(n)
+    units = _units(issue_meta(n), "review")
+    u = next((x for x in units if x["stage"] == "review"), None)
+    if u is None:
+        _advance(gh, n, units, issue)
+        return
     base = gh.default_branch()
-    branch = meta["branch"]
+    branch = u["branch"]
     # Check the PR branch out (base fetched + pulled too) so the reviewer can run
     # git diff itself against the target branch and inspect the whole tree.
     path = repo.ensure_repo(n)
     repo.checkout_branch(path, branch, base)
     summary = _last_bot_summary(gh, n)
-    discussion = _discussion(gh, n, issue=issue, pr_number=meta["pr_number"])
+    discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
     prompt = prompts.render(prompts.REVIEW, NUM=n, TITLE=issue["title"],
-                            SUMMARY=summary, SPECS=_specs_text(meta.get("specs", [])),
+                            SUMMARY=summary, SPECS=_specs_text([u["spec"]]),
                             BRANCH=branch, BASE=base, DISCUSSION=discussion)
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=path,
-                    exclude_family=meta.get("implementer"))
+                    exclude_family=u.get("implementer"))
     model = _model_for("review", fam)
     effort = config.effort_for(model)
     tok = res.input_tokens + res.output_tokens
     status = res.data.get("status")
     if status == "approve":
-        gh.comment(n, f"✅ **Review passed** (by {fam}).\n\n{res.data.get('summary','')}",
+        gh.comment(n, f"✅ **Review passed** for `{u['slug']}` (PR #{u['pr_number']}, "
+                      f"by {fam}).\n\n{res.data.get('summary','')}",
                    model=model, effort=effort, tokens=tok)
-        gh.set_flow(n, config.FLOW_MERGE, issue)
-        log(f"[#{n}] review: approved by {fam} -> flow:merge")
+        u["stage"] = "merge"
+        _save_units(n, units)
+        log(f"[#{n}] review {u['slug']}: approved by {fam}")
+        _advance(gh, n, units, issue)
     elif status == "request_changes":
-        rnd = meta.get("review_round", 0) + 1
+        rnd = u.get("review_round", 0) + 1
         if rnd > config.MAX_REVIEW_ROUNDS:
-            log(f"[#{n}] review: still failing after {config.MAX_REVIEW_ROUNDS} rounds "
-                f"-> escalate (human:needed)")
-            _pause(gh, n, f"Still failing review after {config.MAX_REVIEW_ROUNDS} rounds. "
-                          "Take a look.")
+            log(f"[#{n}] review {u['slug']}: still failing after "
+                f"{config.MAX_REVIEW_ROUNDS} rounds -> escalate (human:needed)")
+            _pause(gh, n, f"`{u['slug']}` still failing review after "
+                          f"{config.MAX_REVIEW_ROUNDS} rounds. Take a look.")
             return
         fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
              res.data.get("summary", "")
-        gh.comment(n, f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}",
-                   model=model, effort=effort, tokens=tok)
-        update_issue_meta(n, review_round=rnd, last_feedback=fb)
-        gh.set_flow(n, config.FLOW_IMPLEMENT, issue)
-        log(f"[#{n}] review: changes requested (round {rnd}, by {fam}) -> flow:implement")
+        gh.comment(n, f"🔁 **Changes requested** on `{u['slug']}` (round {rnd}, "
+                      f"by {fam}):\n{fb}", model=model, effort=effort, tokens=tok)
+        u["review_round"], u["last_feedback"], u["stage"] = rnd, fb, "implement"
+        _save_units(n, units)
+        log(f"[#{n}] review {u['slug']}: changes requested (round {rnd}, by {fam})")
+        _advance(gh, n, units, issue)
     else:
-        log(f"[#{n}] review: needs_human -> escalate")
+        log(f"[#{n}] review {u['slug']}: needs_human -> escalate")
         _pause(gh, n, _failure_reason(res, "Review flagged a judgement call."))
 
 
 def handle_merge(gh, ledger, issue):
+    """Merge (or await) every approved spec PR; close the issue when all are in."""
     n = issue["number"]
-    pr = gh.get_pull(issue_meta(n)["pr_number"])
-    if pr.get("merged"):
-        gh.set_flow(n, config.FLOW_DONE, issue)
-        gh.comment(n, "🎉 Merged. Done.")
-        log(f"[#{n}] merge: PR #{pr.get('number')} merged -> flow:done")
-        return
-    if config.AUTO_MERGE and pr.get("mergeable") and pr.get("mergeable_state") == "clean":
-        gh.merge_pull(pr["number"])
-        gh.set_flow(n, config.FLOW_DONE, issue)
-        gh.comment(n, "🎉 Auto-merged on green. Done.")
-        log(f"[#{n}] merge: auto-merged -> flow:done")
+    units = _units(issue_meta(n), "merge")
+    changed = False
+    for u in units:
+        if u["stage"] == "done" or not u.get("pr_number"):
+            continue
+        pr = gh.get_pull(u["pr_number"])
+        if pr.get("merged"):
+            u["stage"] = "done"
+            changed = True
+            log(f"[#{n}] merge: PR #{pr.get('number')} ({u['slug']}) merged")
+        elif config.AUTO_MERGE and pr.get("mergeable") and \
+                pr.get("mergeable_state") == "clean":
+            gh.merge_pull(pr["number"])
+            u["stage"] = "done"
+            changed = True
+            log(f"[#{n}] merge: auto-merged PR #{pr.get('number')} ({u['slug']})")
+    if changed:
+        _save_units(n, units)
+    pending = [u for u in units if u["stage"] != "done"]
+    if not pending:
+        _advance(gh, n, units, issue)                    # all merged -> close issue
     else:
-        log(f"[#{n}] merge: waiting for you to click merge "
-            f"(mergeable={pr.get('mergeable')}, state={pr.get('mergeable_state')})")
+        log(f"[#{n}] merge: waiting on {len(pending)} PR(s): "
+            + ", ".join(f"#{u.get('pr_number')}" for u in pending))
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
