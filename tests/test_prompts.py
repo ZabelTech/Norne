@@ -99,3 +99,53 @@ def test_every_stage_template_ends_with_a_json_contract():
     for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
                 prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):
         assert "```json" in tpl
+
+
+def test_every_template_has_exactly_one_instructions_placeholder():
+    """Each template contains exactly one <<<INSTRUCTIONS>>> placeholder."""
+    for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
+                prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):
+        assert tpl.count("<<<INSTRUCTIONS>>>") == 1
+
+
+def test_instructions_placeholder_before_json_contract():
+    """The <<<INSTRUCTIONS>>> placeholder appears before the trailing json contract."""
+    for tpl in (prompts.SUMMARIZE, prompts.SPEC, prompts.SPEC_REVIEW,
+                prompts.IMPLEMENT, prompts.FIX, prompts.REVIEW):
+        instructions_idx = tpl.index("<<<INSTRUCTIONS>>>")
+        contract_idx = tpl.index("```json")
+        assert instructions_idx < contract_idx, "INSTRUCTIONS placeholder must come before the json contract"
+
+
+def test_render_without_instructions_leaves_no_residue():
+    """Rendering a template WITHOUT INSTRUCTIONS consumes the placeholder to ''."""
+    out = prompts.render(prompts.SUMMARIZE, NUM=1, TITLE="t", BODY="b",
+                         CLARIFICATIONS="(none)")
+    assert "<<<" not in out
+    assert "INSTRUCTIONS" not in out
+
+
+def test_render_with_instructions_injects_text():
+    """Rendering with INSTRUCTIONS='GUIDE' places GUIDE in the output and keeps the contract intact."""
+    out = prompts.render(prompts.SUMMARIZE, NUM=1, TITLE="t", BODY="b",
+                         CLARIFICATIONS="(none)", INSTRUCTIONS="Follow these rules.")
+    assert "Follow these rules." in out
+    assert "```json" in out  # Contract intact
+    assert '{"status": "clarify" | "ready",' in out
+
+
+def test_render_instructions_applied_last_avoids_collision():
+    """Instruction text containing <<<SPECS>>> survives verbatim (collision-safe)."""
+    out = prompts.render(prompts.REVIEW, NUM=9, TITLE="T", SUMMARY="S",
+                         SPECS="real-specs", BRANCH="b", BASE="main",
+                         DISCUSSION="D", INSTRUCTIONS="see <<<SPECS>>> above")
+    assert "see <<<SPECS>>> above" in out  # Not re-expanded
+    assert "real-specs" in out  # Original token expanded correctly
+
+
+def test_render_default_instructions_is_empty_string_not_none():
+    """Rendering without INSTRUCTIONS defaults to '' (not the literal 'None')."""
+    out = prompts.render(prompts.SUMMARIZE, NUM=1, TITLE="t", BODY="b",
+                         CLARIFICATIONS="(none)")
+    assert "None" not in out
+    assert "INSTRUCTIONS" not in out

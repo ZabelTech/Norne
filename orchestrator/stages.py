@@ -7,7 +7,7 @@ implementer family, paused guidance) lives in store.issue_meta.
 """
 import math
 import time
-from . import config, prompts, repo, runners, router
+from . import config, instructions, prompts, repo, runners, router
 from .github_client import is_bot_comment
 from .log import log
 from .runners import RateLimited
@@ -142,6 +142,21 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
     return fam, res
 
 
+def _build_prompt(template, step, path, **tokens):
+    """Build a prompt with merged general + stage-specific instructions.
+
+    Args:
+        template: The prompt template constant from prompts.py
+        step: The logical pipeline step (e.g., "summarize", "spec", "implement", "review")
+        path: The target repo checkout path (for reading CLAUDE.md)
+        **tokens: Other template tokens (NUM, TITLE, BODY, etc.)
+
+    Returns:
+        The rendered prompt with instructions injected.
+    """
+    return prompts.render(template, INSTRUCTIONS=instructions.load(step, path), **tokens)
+
+
 def _pause(gh, n, reason):
     gh.add_labels(n, [config.FLAG_NEEDS_HUMAN])
     gh.comment(n, f"⏸️ **Needs a human call.**\n\n{reason}\n\n"
@@ -162,11 +177,13 @@ def handle_summarize(gh, ledger, issue):
     # Mark every comment seen so far as acted-on, so a NEW human comment later —
     # at the clarify OR the approval gate — is detected as fresh input to revise.
     update_issue_meta(n, last_comment_seen=max((c["id"] for c in comments), default=0))
-    prompt = prompts.render(prompts.SUMMARIZE, NUM=n, TITLE=issue["title"],
+    # Capture the checkout path BEFORE rendering so the general layer is read from the real checkout
+    path = repo.ensure_repo(n)
+    prompt = _build_prompt(prompts.SUMMARIZE, "summarize", path, NUM=n, TITLE=issue["title"],
                             BODY=issue.get("body") or "(no description)",
                             CLARIFICATIONS=human)
     # Run inside a checkout so the model can investigate the repo, not just /data.
-    fam, res = _run("summarize", ledger, prompt, cwd=repo.ensure_repo(n))
+    fam, res = _run("summarize", ledger, prompt, cwd=path)
     model = _model_for("summarize", fam)
     effort = config.effort_for(model)
     d = res.data
@@ -216,7 +233,7 @@ def handle_spec(gh, ledger, issue):
     rnd = meta.get("spec_round", 0) + 1
     feedback = meta.get("spec_feedback") or "(none)"
 
-    fam, res = _run("spec", ledger, prompts.render(prompts.SPEC, NUM=n,
+    fam, res = _run("spec", ledger, _build_prompt(prompts.SPEC, "spec", path, NUM=n,
                     TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
                     FEEDBACK=feedback), cwd=path)
     author = _participant("spec", fam, res)
@@ -237,9 +254,9 @@ def handle_spec(gh, ledger, issue):
         or "(none — first review)"
     # diversity-of-thought: a DIFFERENT family peer-reviews the specs, weighing
     # the author's responses so a sound rebuttal isn't re-raised.
-    rfam, rev = _run("review", ledger, prompts.render(prompts.SPEC_REVIEW,
-                     SPECS=_specs_text(specs), AUTHOR_RESPONSES=responses,
-                     DISCUSSION=discussion),
+    rfam, rev = _run("review", ledger, _build_prompt(prompts.SPEC_REVIEW,
+                     "spec_review", path, SPECS=_specs_text(specs),
+                     AUTHOR_RESPONSES=responses, DISCUSSION=discussion),
                      cwd=path, exclude_family=fam)
     reviewer = _participant("review", rfam, rev)
     note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
@@ -384,10 +401,11 @@ def handle_implement(gh, ledger, issue):
     rnd = u.get("review_round", 0)
     discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
     if rnd > 0 and u.get("last_feedback"):              # fix iteration
-        prompt = prompts.render(prompts.FIX, NUM=n, ROUND=rnd,
-                                FEEDBACK=u["last_feedback"], DISCUSSION=discussion)
+        prompt = _build_prompt(prompts.FIX, "fix", path, NUM=n, ROUND=rnd,
+                               FEEDBACK=u["last_feedback"], DISCUSSION=discussion)
     else:
-        prompt = prompts.render(prompts.IMPLEMENT, NUM=n, DISCUSSION=discussion)
+        prompt = _build_prompt(prompts.IMPLEMENT, "implement", path, NUM=n,
+                               DISCUSSION=discussion)
     log(f"[#{n}] implement {u['slug']}: "
         f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
     fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
@@ -429,9 +447,9 @@ def handle_review(gh, ledger, issue):
     repo.checkout_branch(path, branch, base)
     summary = _last_bot_summary(gh, n)
     discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
-    prompt = prompts.render(prompts.REVIEW, NUM=n, TITLE=issue["title"],
-                            SUMMARY=summary, SPECS=_specs_text([u["spec"]]),
-                            BRANCH=branch, BASE=base, DISCUSSION=discussion)
+    prompt = _build_prompt(prompts.REVIEW, "review", path, NUM=n, TITLE=issue["title"],
+                           SUMMARY=summary, SPECS=_specs_text([u["spec"]]),
+                           BRANCH=branch, BASE=base, DISCUSSION=discussion)
     # cross-check: review with the OTHER family than implemented
     fam, res = _run("review", ledger, prompt, cwd=path,
                     exclude_family=u.get("implementer"))

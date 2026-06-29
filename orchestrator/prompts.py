@@ -10,6 +10,11 @@ def render(tpl, **kw):
     out = tpl
     for k, v in kw.items():
         out = out.replace(f"<<<{k}>>>", str(v))
+    # INSTRUCTIONS is applied LAST (after every other token) so instruction text
+    # containing e.g. <<<SPECS>>> doesn't get re-expanded. Default to "" so the
+    # placeholder is consumed to "" when absent (never the literal 'None').
+    instructions = kw.pop("INSTRUCTIONS", "")
+    out = out.replace("<<<INSTRUCTIONS>>>", str(instructions))
     return out
 
 
@@ -18,6 +23,8 @@ code-generation pipeline. You are running inside a checkout of the TARGET
 repository — investigate it (its code, layout, and docs) to ground your
 understanding before answering, e.g. to learn the pipeline's actual stages
 rather than guessing.
+
+<<<INSTRUCTIONS>>>
 
 ISSUE #<<<NUM>>>: <<<TITLE>>>
 ---
@@ -39,6 +46,8 @@ End with exactly one json block:
 ```"""
 
 SPEC = """Turn this approved request into one or more implementation specs.
+
+<<<INSTRUCTIONS>>>
 
 APPROVED SUMMARY for issue #<<<NUM>>> (<<<TITLE>>>):
 <<<SUMMARY>>>
@@ -84,6 +93,8 @@ non-blocking imperfections are fine and must NOT hold up approval. Return
 "concerns" only when there is at least one genuinely blocking problem, and list
 just those (be concise).
 
+<<<INSTRUCTIONS>>>
+
 SPECS:
 <<<SPECS>>>
 
@@ -110,6 +121,8 @@ Implement every work item. Follow the repo's conventions and CLAUDE.md. Write
 or update tests, and run the test/lint commands. Make focused git commits with
 clear messages. DO NOT push and DO NOT open a PR — the orchestrator does that.
 
+<<<INSTRUCTIONS>>>
+
 CONTEXT — the issue and its full discussion (intent; (bot) lines are prior
 pipeline output, (human) lines are the source of truth):
 <<<DISCUSSION>>>
@@ -132,6 +145,8 @@ CONTEXT — the issue, PR, and full discussion:
 <<<DISCUSSION>>>
 
 Make the changes, update tests, run tests/lint, and commit. Do not push.
+
+<<<INSTRUCTIONS>>>
 
 End with exactly one json block:
 ```json
@@ -163,6 +178,8 @@ Check correctness, that acceptance criteria are met, test coverage, and obvious
 bugs/security issues. Approve only if it genuinely satisfies the spec. Use
 request_changes for fixable issues. Use needs_human only for a judgement call a
 human must make (e.g. the spec itself looks wrong, or a real tradeoff).
+
+<<<INSTRUCTIONS>>>
 
 End with exactly one json block:
 ```json
