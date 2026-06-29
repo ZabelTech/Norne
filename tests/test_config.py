@@ -92,6 +92,18 @@ def test_spec_round_cap_is_a_positive_int():
     assert isinstance(config.MAX_SPEC_ROUNDS, int) and config.MAX_SPEC_ROUNDS >= 1
 
 
+def test_claude_has_split_per_window_safety_fractions():
+    # 90% on the fast 5h window, 80% on the protective weekly cap.
+    assert config.CLAUDE_5H_SAFETY_FRACTION == 0.90
+    assert config.CLAUDE_WEEK_SAFETY_FRACTION == 0.80
+    assert config.CLAUDE_WEEK_SAFETY_FRACTION < config.CLAUDE_5H_SAFETY_FRACTION
+
+
+def test_cache_reads_are_weighted_below_full():
+    # Cache reads must be discounted (the over-count fix), not counted at 1x.
+    assert 0 <= config.CLAUDE_CACHE_READ_WEIGHT < 1
+
+
 def test_every_models_effort_is_tunable():
     # Each per-model effort label must resolve to a real tuning entry.
     for effort in config.EFFORT_BY_MODEL.values():

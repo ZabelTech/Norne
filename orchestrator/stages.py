@@ -60,24 +60,35 @@ def _failure_reason(res, default):
     return default
 
 
-def _implement_escalation(res, path):
+def _implement_escalation(res, path, base=None):
     """A precise reason when an implement/fix run didn't report `done`. Tells the
-    human *how* it failed: a timed-out / crashed process vs. an agent that wrote
-    code but never emitted its result block — and lists the uncommitted files it
-    left in the checkout so the work isn't silently stranded."""
+    human *how* it failed (timed out vs. the subprocess crashed — with the actual
+    error output) and what state it left behind: commits the agent made on its
+    branch AND any still-uncommitted files, so the work isn't silently stranded."""
     parts = []
-    if not res.ok:
+    raw = (res.raw or "").strip()
+    crashed = not res.ok
+    if crashed:
         parts.append("The implement run did not finish cleanly" + (
-            " — it hit the time limit." if (res.raw or "").strip() == "timeout"
+            " — it hit the time limit." if raw == "timeout"
             else " — the agent process exited with an error."))
+    # Work the agent committed on its branch (whether or not it was pushed) — so we
+    # don't misreport "nothing was committed" when a whole feature is sitting there.
+    committed = repo.local_commits(path, base) if base else []
+    if committed:
+        shown = "\n".join(f"- {c}" for c in committed[:10])
+        more = f"\n…and {len(committed) - 10} more" if len(committed) > 10 else ""
+        parts.append(f"It had already committed **{len(committed)} commit(s)** on the "
+                     f"branch (unpushed — the run never reported `done`):\n{shown}{more}")
     changed = repo.dirty_files(path)
     if changed:
         shown = "\n".join(f"- `{f}`" for f in changed[:20])
         more = f"\n…and {len(changed) - 20} more" if len(changed) > 20 else ""
-        parts.append(
-            f"It left **{len(changed)} uncommitted file(s)** in the work checkout — "
-            f"it changed code but never reported `done`, so nothing was committed or "
-            f"pushed:\n{shown}{more}")
+        parts.append(f"It also left **{len(changed)} uncommitted file(s)**:\n{shown}{more}")
+    # On a crash, surface the subprocess's own output so the failure is diagnosable
+    # (the orchestrator otherwise only logs a one-line ok=False summary).
+    if crashed and raw and raw != "timeout":
+        parts.append("Subprocess output (tail):\n```\n" + raw[-1200:] + "\n```")
     detail = _failure_reason(res, "")
     if detail:
         parts.append(detail)
@@ -126,47 +137,62 @@ def _record(ledger, fam, res):
 
 
 def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
-    """Route -> reserve -> run -> reconcile. Raises BudgetParked if no pool has headroom."""
-    fam = router.choose_family(stage, ledger, exclude_family=exclude_family)
-    if fam is None:
-        log(f"  {stage}: no model family has budget headroom -> parking")
-        raise BudgetParked()
-    model = _model_for(stage, fam)
-    effort = config.effort_for(model)
-    log(f"  {stage}: calling {fam}/{model} ({effort})…")
-    t0 = time.time()
-    runner = runners.get_runner(fam)
+    """Route -> reserve -> run -> reconcile. Reserve pre-charges an estimate so
+    the budget gate is atomic under concurrent runs; reconcile corrects to actual
+    usage after. When a family is actually rate-limited by its provider, refund
+    the reservation, cool it down, and fall back to any other eligible family;
+    park (BudgetParked) only once EVERY family is out of budget / cooling."""
+    tried = set()
+    while True:
+        fam = router.choose_family(stage, ledger, exclude_family=exclude_family,
+                                   skip=tried)
+        if fam is None:
+            why = (f"all families out of budget after {', '.join(sorted(tried))} "
+                   "rate-limited") if tried else "no model family has budget headroom"
+            log(f"  {stage}: {why} -> parking")
+            raise BudgetParked()
+        model = _model_for(stage, fam)
+        effort = config.effort_for(model)
 
-    # Reserve estimated budget before the run (atomic gate).
-    if fam == "claude":
-        reserved_tokens = config.CLAUDE_RESERVE_TOKENS
-        reserved_prompts = 0
-    else:  # glm
-        reserved_tokens = 0
-        reserved_prompts = config.GLM_RESERVE_PROMPTS
+        # Reserve an estimate before the run (atomic gate for concurrency).
+        if fam == "claude":
+            reserved_tokens, reserved_prompts = config.CLAUDE_RESERVE_TOKENS, 0
+        else:
+            reserved_tokens, reserved_prompts = 0, config.GLM_RESERVE_PROMPTS
+        if not ledger.reserve(fam, tokens=reserved_tokens, prompts=reserved_prompts):
+            # Pool exhausted between router choice and reservation -> try the next.
+            log(f"  {stage}: {fam} exhausted during reservation -> trying another family")
+            tried.add(fam)
+            continue
 
-    if not ledger.reserve(fam, tokens=reserved_tokens, prompts=reserved_prompts):
-        # Pool exhausted between router choice and reservation — treat as parked.
-        log(f"  {stage}: {fam} exhausted during reservation -> parking")
-        raise BudgetParked()
+        log(f"  {stage}: calling {fam}/{model} ({effort})…")
+        t0 = time.time()
+        runner = runners.get_runner(fam)
+        try:
+            res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
+        except RateLimited:
+            # The run didn't happen: refund the reservation, cool the pool, fall back.
+            ledger.reconcile(fam, reserved_tokens=reserved_tokens,
+                             reserved_prompts=reserved_prompts,
+                             actual_tokens=0, actual_prompts=0)
+            ledger.cool_down(fam, config.RATE_LIMIT_COOLDOWN)
+            tried.add(fam)
+            log(f"  {stage}: {fam} rate-limited by provider -> cooling "
+                f"{config.RATE_LIMIT_COOLDOWN}s, falling back to another family")
+            continue
 
-    res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
+        # Reconcile the estimate to actual usage.
+        if fam == "claude":
+            actual_tokens, actual_prompts = res.input_tokens + res.output_tokens, 0
+        else:
+            actual_tokens, actual_prompts = 0, math.ceil(config.GLM_QUOTA_MULTIPLIER)
+        ledger.reconcile(fam, reserved_tokens=reserved_tokens,
+                         reserved_prompts=reserved_prompts,
+                         actual_tokens=actual_tokens, actual_prompts=actual_prompts)
 
-    # Reconcile to actual usage after the run.
-    if fam == "claude":
-        actual_tokens = res.input_tokens + res.output_tokens
-        actual_prompts = 0
-    else:  # glm
-        actual_tokens = 0
-        actual_prompts = math.ceil(config.GLM_QUOTA_MULTIPLIER)
-
-    ledger.reconcile(fam,
-                     reserved_tokens=reserved_tokens, reserved_prompts=reserved_prompts,
-                     actual_tokens=actual_tokens, actual_prompts=actual_prompts)
-
-    log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
-        f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
-    return fam, res
+        log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
+            f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
+        return fam, res
 
 
 def _build_prompt(template, step, path, **tokens):
@@ -493,7 +519,7 @@ def handle_implement(gh, ledger, issue):
             fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
 
             if res.data.get("status") != "done":
-                reason = _implement_escalation(res, path)
+                reason = _implement_escalation(res, path, base)
                 return {"slug": slug, "status": "escalate", "reason": reason}
 
             repo.commit_all(path, f"implement #{n} {slug}"
@@ -637,15 +663,16 @@ def handle_review(gh, ledger, issue):
     escalation_reasons = []
     for r in results:
         slug = r["slug"]
+        pr_number = next(u["pr_number"] for u in units if u["slug"] == slug)
         if r["status"] == "approve":
-            gh.comment(n, f"✅ **Review passed** for `{slug}` (PR "
-                       f"#{next(u['pr_number'] for u in units if u['slug']==slug)}, "
-                       f"by {r['family']}).\n\n{r['summary']}",
+            # Review feedback goes on the PR (the code under review), not the issue.
+            gh.comment(pr_number, f"✅ **Review passed** (by {r['family']}).\n\n{r['summary']}",
                        model=r["model"], effort=r["effort"], tokens=r["tokens"])
             _update_unit(n, slug, stage="merge")
             log(f"[#{n}] review {slug}: approved by {r['family']}")
         elif r["status"] == "request_changes":
-            gh.comment(n, f"🔁 **Changes requested** on `{slug}` (round {r['round']}, "
+            # Review feedback goes on the PR (the code under review), not the issue.
+            gh.comment(pr_number, f"🔁 **Changes requested** (round {r['round']}, "
                        f"by {r['family']}):\n{r['feedback']}",
                        model=r["model"], effort=r["effort"], tokens=r["tokens"])
             _update_unit(n, slug, review_round=r["round"],

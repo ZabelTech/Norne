@@ -23,11 +23,17 @@ def _eligible(family, ledger):
     return config.family_available(family) and ledger.headroom(family)
 
 
-def choose_family(stage, ledger, exclude_family=None):
+def choose_family(stage, ledger, exclude_family=None, skip=None):
+    """Pick a family for the stage. `skip` is a set of families to treat as
+    ineligible regardless (e.g. ones already rate-limited this run), so the
+    caller can fall back across families and only park when ALL are out."""
+    skip = skip or set()
     families = config.ROUTING[stage]
     # Prefer a family OTHER than the excluded (implementer) one — the
     # diversity-of-thought cross-check.
     for fam in families:
+        if fam in skip:
+            continue
         if exclude_family and fam == exclude_family:
             continue
         if _eligible(fam, ledger):
@@ -38,6 +44,6 @@ def choose_family(stage, ledger, exclude_family=None):
     # family if it can still run. The review stage always uses that family's
     # BEST model + high effort, so a self-review is still a solid check; a true
     # cross-family review resumes automatically once the other window resets.
-    if exclude_family and _eligible(exclude_family, ledger):
+    if exclude_family and exclude_family not in skip and _eligible(exclude_family, ledger):
         return exclude_family
     return None

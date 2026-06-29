@@ -112,19 +112,38 @@ class Ledger:
                 p[w]["prompts"] += prompts
             self._save()
 
+    def cool_down(self, pool, seconds):
+        """Back a pool off after a real provider rate-limit. Independent of the
+        local window counters (which can't see the provider's own quota), so the
+        router stops re-picking the family and the blocked:budget gate stops
+        un-parking until the cooldown expires."""
+        with self._lock:
+            self.d[pool]["cooldown_until"] = time.time() + seconds
+            self._save()
+
+    def cooling(self, pool):
+        """True while a pool is backed off from a provider rate-limit."""
+        return time.time() < self.d.get(pool, {}).get("cooldown_until", 0)
+
     def _has_headroom(self, pool):
-        """Internal: check headroom assuming lock is held."""
-        f = config.BUDGET_SAFETY_FRACTION
+        """Internal: check headroom assuming the lock is held. False while a pool
+        is cooling off from a provider rate-limit."""
+        if self.cooling(pool):
+            return False
         p = self.d[pool]
         if pool == "claude":
-            return (p["w5"]["tokens"] < config.CLAUDE_5H_TOKEN_BUDGET * f and
-                    p["wk"]["tokens"] < config.CLAUDE_WEEK_TOKEN_BUDGET * f)
+            # Per-window ceilings: hotter on the fast-refilling 5h window, more
+            # protective on the weekly cap.
+            return (p["w5"]["tokens"] < config.CLAUDE_5H_TOKEN_BUDGET * config.CLAUDE_5H_SAFETY_FRACTION and
+                    p["wk"]["tokens"] < config.CLAUDE_WEEK_TOKEN_BUDGET * config.CLAUDE_WEEK_SAFETY_FRACTION)
+        f = config.BUDGET_SAFETY_FRACTION
         lim = config.GLM_TIER_LIMITS[config.GLM_TIER]
         return (p["w5"]["prompts"] < lim["per5h"] * f and
                 p["wk"]["prompts"] < lim["perweek"] * f)
 
     def headroom(self, pool):
-        """True if this pool has room for another step in both windows."""
+        """True if this pool has room for another step in both windows (and isn't
+        cooling off from a provider rate-limit)."""
         with self._lock:
             self._roll()
             return self._has_headroom(pool)

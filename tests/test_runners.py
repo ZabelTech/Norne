@@ -53,15 +53,29 @@ def test_claude_cc_json_parses_result_and_usage():
     assert otok == 30
 
 
-def test_claude_cc_json_counts_cache_reads_as_input():
+def test_claude_cc_json_discounts_cache_reads_and_counts_cache_writes():
+    # Effective input = fresh input + cache creation (full) + 0.1 * cache reads.
     line = json.dumps({
         "result": "x",
-        "usage": {"input_tokens": 10, "cache_read_input_tokens": 90,
-                  "output_tokens": 5},
+        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20,
+                  "cache_read_input_tokens": 900, "output_tokens": 5},
     })
     _, itok, otok = runners._claude_cc_json(line)
-    assert itok == 100  # 10 + 90
+    assert itok == 10 + 20 + int(0.1 * 900)              # 10 + 20 + 90 = 120
     assert otok == 5
+
+
+def test_claude_cc_json_cache_read_heavy_run_is_not_over_counted():
+    # The bug: a long agentic run re-reads a big cached context every turn. Those
+    # cache reads must NOT dominate the budget tally.
+    line = json.dumps({
+        "result": "ok",
+        "usage": {"input_tokens": 1000, "cache_read_input_tokens": 5_000_000,
+                  "output_tokens": 2000},
+    })
+    _, itok, _ = runners._claude_cc_json(line)
+    assert itok == 1000 + int(0.1 * 5_000_000)           # 501000, not 5_001_000
+    assert itok < 600_000
 
 
 def test_claude_cc_json_uses_last_line():

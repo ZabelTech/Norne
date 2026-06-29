@@ -33,17 +33,20 @@ def test_record_glm_prompts_accumulate(fresh_ledger):
     assert fresh_ledger.d["glm"]["wk"]["prompts"] == 3
 
 
-def test_claude_headroom_respects_safety_fraction(fresh_ledger):
-    # Budget 1000 * safety 0.85 = 850 soft ceiling for the 5h window.
-    fresh_ledger.record("claude", tokens=849)
+def test_claude_5h_window_respects_its_safety_fraction(fresh_ledger):
+    # Budget 1000 * CLAUDE_5H_SAFETY_FRACTION 0.90 = 900 soft 5h ceiling.
+    fresh_ledger.record("claude", tokens=899)
     assert fresh_ledger.headroom("claude") is True
-    fresh_ledger.record("claude", tokens=1)  # now at 850, not < 850
+    fresh_ledger.record("claude", tokens=1)  # now at 900, not < 900
     assert fresh_ledger.headroom("claude") is False
 
 
-def test_claude_weekly_window_can_block_independently(fresh_ledger):
-    # Spend under the 5h ceiling but over the weekly one by faking the weekly tally.
-    fresh_ledger.d["claude"]["wk"]["tokens"] = 9000  # > 10000 * 0.85
+def test_claude_weekly_window_uses_its_own_lower_fraction(fresh_ledger):
+    # Weekly cap is protected harder: 10000 * CLAUDE_WEEK_SAFETY_FRACTION 0.80 = 8000.
+    fresh_ledger.d["claude"]["wk"]["tokens"] = 7999
+    fresh_ledger._save()
+    assert fresh_ledger.headroom("claude") is True       # under the weekly ceiling
+    fresh_ledger.d["claude"]["wk"]["tokens"] = 8000      # at the ceiling -> blocked
     fresh_ledger._save()
     assert fresh_ledger.headroom("claude") is False
 
@@ -72,6 +75,23 @@ def test_weekly_window_survives_a_five_hour_roll(fresh_ledger, clock):
     fresh_ledger.headroom("claude")  # triggers the 5h roll only
     assert fresh_ledger.d["claude"]["w5"]["tokens"] == 0
     assert fresh_ledger.d["claude"]["wk"]["tokens"] == 400  # weekly persists
+
+
+def test_cool_down_blocks_headroom_until_it_expires(fresh_ledger, clock):
+    assert fresh_ledger.headroom("glm") is True
+    fresh_ledger.cool_down("glm", 600)
+    assert fresh_ledger.cooling("glm") is True
+    assert fresh_ledger.headroom("glm") is False         # backed off despite empty counters
+    assert fresh_ledger.headroom("claude") is True       # other pool unaffected
+    clock.advance(601)
+    assert fresh_ledger.cooling("glm") is False
+    assert fresh_ledger.headroom("glm") is True          # auto-recovers after the window
+
+
+def test_cool_down_persists_across_ledger_instances(fresh_ledger, clock, ledger_paths):
+    fresh_ledger.cool_down("glm", 600)
+    # A fresh Ledger view (as the worker creates per issue) still sees the cooldown.
+    assert store.Ledger().headroom("glm") is False
 
 
 def test_next_reset_points_at_the_soonest_window(fresh_ledger, clock):
@@ -174,13 +194,13 @@ def test_concurrent_ledger_record_produces_exact_tallies(ledger_paths, clock):
 def test_reserve_returns_false_when_pool_lacks_headroom(ledger_paths, clock):
     """Reserve when a pool is at ceiling returns False and charges nothing."""
     fresh_ledger = store.Ledger()
-    # Exhaust the claude pool.
-    fresh_ledger.record("claude", tokens=850)  # at ceiling (1000 * 0.85)
+    # Exhaust the claude pool (5h ceiling = 1000 * CLAUDE_5H_SAFETY_FRACTION 0.90).
+    fresh_ledger.record("claude", tokens=900)  # at ceiling
 
     assert fresh_ledger.headroom("claude") is False
     assert fresh_ledger.reserve("claude", tokens=100) is False
-    # Still at 850 — nothing charged.
-    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 850
+    # Still at 900 — nothing charged.
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 900
 
 
 def test_reserve_returns_true_and_precharges_when_pool_has_headroom(ledger_paths):

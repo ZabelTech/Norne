@@ -3,34 +3,36 @@
 Tests worktree path isolation, primary-detach-before-add behavior, and worktree
 cleanup. Hermetic — no real git calls (git commands are captured/stubbed).
 """
+import os
 from unittest.mock import MagicMock
-from orchestrator import repo
+from orchestrator import config, repo
 
 
 def test_workdir_spec_returns_isolated_sibling_paths():
     """workdir_spec returns distinct paths per slug, outside the primary checkout."""
-    assert repo.workdir_spec(5, "implement") == "/data/work/worktrees/issue-5/implement"
-    assert repo.workdir_spec(5, "review") == "/data/work/worktrees/issue-5/review"
+    root = config.WORKDIR_ROOT
+    assert repo.workdir_spec(5, "implement") == os.path.join(root, "worktrees", "issue-5", "implement")
+    assert repo.workdir_spec(5, "review") == os.path.join(root, "worktrees", "issue-5", "review")
     # Different issues get different containers.
-    assert repo.workdir_spec(7, "implement") == "/data/work/worktrees/issue-7/implement"
+    assert repo.workdir_spec(7, "implement") == os.path.join(root, "worktrees", "issue-7", "implement")
 
 
 def test_workdir_spec_does_not_nest_inside_primary():
     """worktree paths are siblings to the primary, not nested under it.
 
-    The approved summary wrote `/data/work/issue-N/<slug>`, but that would
-    nest worktrees inside the primary checkout, making git operations on the
-    primary treat worktrees as untracked junk. Using `worktrees/issue-N/<slug>`
+    The approved summary wrote `<root>/issue-N/<slug>`, but that would nest
+    worktrees inside the primary checkout, making git operations on the primary
+    treat worktrees as untracked junk. Using `<root>/worktrees/issue-N/<slug>`
     keeps each spec tree cleanly isolated.
     """
-    primary = repo.workdir(5)  # /data/work/issue-5
-    worktree = repo.workdir_spec(5, "implement")  # /data/work/worktrees/issue-5/implement
+    primary = repo.workdir(5)                      # <root>/issue-5
+    worktree = repo.workdir_spec(5, "implement")   # <root>/worktrees/issue-5/implement
 
     # worktree is NOT a descendant of the primary.
-    assert not worktree.startswith(primary)
-    # Both share the same WORKDIR_ROOT parent.
-    assert primary.startswith("/data/work")
-    assert worktree.startswith("/data/work")
+    assert not worktree.startswith(primary + os.sep)
+    # Both live under the same workdir root.
+    assert primary.startswith(config.WORKDIR_ROOT)
+    assert worktree.startswith(config.WORKDIR_ROOT)
 
 
 def test_ensure_worktree_detaches_primary_before_add(monkeypatch):

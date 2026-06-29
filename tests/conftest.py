@@ -27,6 +27,9 @@ os.environ.setdefault("CLAUDE_WEEK_TOKEN_BUDGET", "10000")
 os.environ.setdefault("GLM_TIER", "lite")
 os.environ.setdefault("GLM_QUOTA_MULTIPLIER", "2.0")
 os.environ.setdefault("BUDGET_SAFETY_FRACTION", "0.85")
+os.environ.setdefault("CLAUDE_5H_SAFETY_FRACTION", "0.90")
+os.environ.setdefault("CLAUDE_WEEK_SAFETY_FRACTION", "0.80")
+os.environ.setdefault("CLAUDE_CACHE_READ_WEIGHT", "0.1")
 
 import pytest
 

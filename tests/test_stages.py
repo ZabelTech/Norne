@@ -193,15 +193,13 @@ def test_run_raises_budget_parked_when_no_family(monkeypatch):
 
 
 def test_run_raises_budget_parked_when_reserve_returns_false(monkeypatch):
-    """BudgetParked/failover: reserve() returning False raises BudgetParked.
+    """Failover then park: reserve() returning False makes _run skip that family
+    and try the next; when no family is left it raises BudgetParked.
 
     This tests the path where the pool exhausts between router choice and
     reservation — exactly where the blocking bug hides.
     """
     led = RecordingLedger()
-
-    # Reserve returns False (pool exhausted during reservation)
-    original_reserve = led.reserve
 
     def reserve_returns_false(pool, tokens=0, prompts=0):
         # Still record the call for test verification
@@ -210,8 +208,11 @@ def test_run_raises_budget_parked_when_reserve_returns_false(monkeypatch):
 
     led.reserve = reserve_returns_false
 
-    # Router chooses a family, but reserve fails
-    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    # Router offers claude once, then (skipped) has nothing left -> park.
+    def choose(stage, ledger, exclude_family=None, skip=None):
+        return None if (skip and "claude" in skip) else "claude"
+
+    monkeypatch.setattr(stages.router, "choose_family", choose)
     monkeypatch.setattr(stages.runners, "get_runner",
                         lambda fam: StubRunner("claude", RunResult(ok=True, text="")))
 
@@ -230,7 +231,7 @@ def test_run_forwards_exclude_family(monkeypatch):
     led = RecordingLedger()
     captured = {}
 
-    def fake_choose(stage, ledger, exclude_family=None):
+    def fake_choose(stage, ledger, exclude_family=None, skip=None):
         captured["exclude"] = exclude_family
         return "glm"
 
@@ -239,6 +240,58 @@ def test_run_forwards_exclude_family(monkeypatch):
                         lambda fam: StubRunner("glm", RunResult(ok=True, text="")))
     stages._run("review", led, "P", cwd="/w", exclude_family="claude")
     assert captured["exclude"] == "claude"
+
+
+class _RLRunner:
+    """A runner that raises RateLimited for named families, else returns ok."""
+    def __init__(self, family, rate_limited):
+        self.family = family
+        self._rl = rate_limited
+
+    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+        if self.family in self._rl:
+            raise stages.RateLimited(self.family)
+        return RunResult(ok=True, text="", input_tokens=1, output_tokens=1)
+
+
+def test_run_falls_back_to_another_family_when_one_is_rate_limited(monkeypatch):
+    # glm is rate-limited by the provider -> cool it down, fall back to claude.
+    led = RecordingLedger()
+    cooled = []
+    led.cool_down = lambda pool, seconds: cooled.append((pool, seconds))
+    order = ["glm", "claude"]
+
+    def choose(stage, ledger, exclude_family=None, skip=None):
+        for f in order:
+            if f not in (skip or set()):
+                return f
+        return None
+
+    monkeypatch.setattr(stages.router, "choose_family", choose)
+    monkeypatch.setattr(stages.runners, "get_runner",
+                        lambda fam: _RLRunner(fam, {"glm"}))
+    fam, res = stages._run("implement", led, "P", cwd="/w", write=True)
+    assert fam == "claude"                               # fell back
+    assert res.ok
+    assert cooled and cooled[0][0] == "glm"              # glm cooled down
+
+
+def test_run_parks_only_when_all_families_rate_limited(monkeypatch):
+    led = RecordingLedger()
+    led.cool_down = lambda pool, seconds: None
+    order = ["glm", "claude"]
+
+    def choose(stage, ledger, exclude_family=None, skip=None):
+        for f in order:
+            if f not in (skip or set()):
+                return f
+        return None
+
+    monkeypatch.setattr(stages.router, "choose_family", choose)
+    monkeypatch.setattr(stages.runners, "get_runner",
+                        lambda fam: _RLRunner(fam, {"glm", "claude"}))
+    with pytest.raises(stages.BudgetParked):
+        stages._run("implement", led, "P", cwd="/w", write=True)
 
 
 # ── review-round attribution ────────────────────────────────────────────────
@@ -316,6 +369,37 @@ def test_implement_escalation_falls_back_when_nothing_known(monkeypatch):
     monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
     r = stages._implement_escalation(RunResult(ok=True, text="", data={}), "/w")
     assert r == "Implementation hit a blocker."
+
+
+def test_implement_escalation_surfaces_subprocess_output_on_crash(monkeypatch):
+    # A non-zero exit (not a timeout) must include the subprocess's actual output
+    # so the crash is diagnosable — this is the #5 blind spot.
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=False, text="", data={},
+                    raw="...\nz.ai: 503 upstream error\nfatal: stream closed")
+    r = stages._implement_escalation(res, "/w")
+    assert "exited with an error" in r
+    assert "z.ai: 503 upstream error" in r               # raw output surfaced
+    assert "Subprocess output" in r
+
+
+def test_implement_escalation_reports_committed_work(monkeypatch):
+    # When the agent committed a feature but the run died before `done`, say so —
+    # don't imply nothing was written.
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: ["tests/test_x.py"])
+    monkeypatch.setattr(stages.repo, "local_commits",
+                        lambda path, base: ["21ba79b Implement the feature",
+                                            "WIP tests"])
+    res = RunResult(ok=False, text="", data={}, raw="boom")
+    r = stages._implement_escalation(res, "/w", base="main")
+    assert "2 commit(s)" in r and "Implement the feature" in r
+    assert "1 uncommitted file(s)" in r                  # both states reported
+
+
+def test_implement_escalation_timeout_skips_raw_dump(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    r = stages._implement_escalation(RunResult(ok=False, text="", data={}, raw="timeout"), "/w")
+    assert "time limit" in r and "Subprocess output" not in r
 
 
 def test_pause_records_comment_baseline(monkeypatch):
@@ -473,6 +557,7 @@ class _FanGH:
         self.labels_added = []
         self._pulls = pulls or {}                 # branch -> existing PR (or none)
         self._by_number = {}
+        self.comment_calls = []                    # (target_number, body)
 
     def default_branch(self):
         return self.default
@@ -485,6 +570,7 @@ class _FanGH:
 
     def comment(self, n, body, **k):
         self.comments.append(body)
+        self.comment_calls.append((n, body))
 
     def add_labels(self, n, labels):
         self.labels_added.extend(labels)
@@ -640,7 +726,43 @@ def test_review_approve_moves_unit_to_merge(monkeypatch):
     monkeypatch.setattr(stages, "_advance", lambda *a: None)  # Mock _advance to avoid further processing
     stages.handle_review(gh, None, {"number": 1, "title": "T"})
     assert units[0]["stage"] == "merge"
-    assert len(gh.comments) == 1  # Should have commented about approval
+    # The review verdict is posted on the PR (#201), never on the issue (#1).
+    targets = [t for t, _ in gh.comment_calls]
+    assert 201 in targets and 1 not in targets
+
+
+def _review_fanout_env(monkeypatch, units, run_result):
+    """Wire the fan-out handle_review: worktrees + in-place _update_unit + a
+    stubbed _run, with _advance neutralised so we assert the per-unit transition."""
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
+    monkeypatch.setattr(stages, "_run", lambda *a, **k: ("claude", run_result))
+    monkeypatch.setattr(stages, "_advance", lambda *a: None)
+
+
+def test_review_request_changes_comments_on_the_pr(monkeypatch):
+    units = [{"slug": "a", "title": "A", "branch": "b/a", "spec": _two_specs()[0],
+              "stage": "review", "pr_number": 201, "review_round": 0,
+              "last_feedback": None, "implementer": "glm"}]
+    _review_fanout_env(monkeypatch, units, RunResult(
+        ok=True, text="", data={"status": "request_changes",
+                                "comments": ["fix the lock"]}))
+    gh = _FanGH()
+    stages.handle_review(gh, None, {"number": 1, "title": "T"})
+    target, body = gh.comment_calls[-1]
+    assert target == 201                                 # on the PR, not issue #1
+    assert "Changes requested" in body and "fix the lock" in body
+    assert units[0]["stage"] == "implement"              # bounced back to implement
 
 
 # ── summarize: don't post an empty "(clarify)" placeholder ────────────────────
