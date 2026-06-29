@@ -50,22 +50,72 @@ def _save(path, data):
 
 
 # ── Per-issue metadata ────────────────────────────────────────────────────
-def issue_meta(n):
+def issue_meta(key):
+    """Get metadata for an issue by its namespaced key (e.g. 'owner/repo#5')."""
     lock = _lock_for(ISSUES_PATH)
     with lock:
         data = _load(ISSUES_PATH, {})
-        return data.get(str(n), {})
+        return data.get(key, {})
 
 
-def update_issue_meta(n, **fields):
+def update_issue_meta(key, **fields):
+    """Update metadata for an issue by its namespaced key (e.g. 'owner/repo#5')."""
     lock = _lock_for(ISSUES_PATH)
     with lock:
         data = _load(ISSUES_PATH, {})
-        m = data.get(str(n), {})
+        m = data.get(key, {})
         m.update(fields)
-        data[str(n)] = m
+        data[key] = m
         _save(ISSUES_PATH, data)
         return m
+
+
+def migrate_legacy_keys(repo_slug):
+    """One-time migration: convert bare integer keys to namespaced keys.
+
+    Called at startup to prevent data loss when upgrading from single-repo
+    to multi-repo deployments. Keys like '5' become 'owner/repo#5'.
+    Keys already containing '#' are left untouched (idempotent).
+    If repo_slug is None and bare keys exist, logs a warning and leaves them.
+
+    Args:
+        repo_slug: The repo slug to attribute legacy keys to (e.g. 'owner/repo').
+                   If None, bare keys are left in place with a warning.
+    """
+    import re
+    lock = _lock_for(ISSUES_PATH)
+    with lock:
+        data = _load(ISSUES_PATH, {})
+        migrated = []
+        skipped = []
+        bare_without_slug = []
+        for key in list(data.keys()):
+            if "#" in key:
+                # Already namespaced — skip
+                skipped.append(key)
+                continue
+            if not re.match(r"^\d+$", key):
+                # Not a bare integer — skip
+                skipped.append(key)
+                continue
+            # Bare integer key — migrate or collect for warning
+            if repo_slug is None:
+                bare_without_slug.append(key)
+                continue
+            new_key = f"{repo_slug}#{key}"
+            value = data[key]
+            data[new_key] = value
+            del data[key]
+            migrated.append((key, new_key))
+        if bare_without_slug:
+            import logging
+            logging.warning(
+                f"Cannot migrate legacy bare key(s) {bare_without_slug} without repo_slug. "
+                f"Set GH_REPO to enable migration. Leaving them untouched."
+            )
+        if migrated:
+            _save(ISSUES_PATH, data)
+        return migrated, skipped
 
 
 # ── Budget ledger ─────────────────────────────────────────────────────────

@@ -9,7 +9,8 @@ def _b(name, default="false"):
 
 # ── Connection ────────────────────────────────────────────────────────────
 GH_TOKEN = os.environ["GH_TOKEN"]
-GH_REPO = os.environ["GH_REPO"]                       # "owner/repo"
+GH_REPO = os.environ.get("GH_REPO")                   # "owner/repo" (optional if GH_OWNER set)
+GH_OWNER = os.environ.get("GH_OWNER")                  # org owner (optional if GH_REPO set)
 BOT_LOGIN = os.environ.get("BOT_LOGIN", "").lower()    # informational; NOT the identity
 # signal anymore — bot comments are tagged with a marker (see github_client), so the
 # pipeline works even when it posts under a human's own token (shared identity).
@@ -175,6 +176,16 @@ EFFORT_TUNING = {
 def effort_tuning(effort):
     """Resolve an effort label to its {directive, max_turns}, defaulting to medium."""
     return EFFORT_TUNING.get(effort, EFFORT_TUNING["medium"])
+
+
+# ── Multi-repo validation ─────────────────────────────────────────────────────
+def validate_config():
+    """Ensure at least one of GH_OWNER or GH_REPO is set. Call once at startup."""
+    if not GH_OWNER and not GH_REPO:
+        raise RuntimeError(
+            "At least one of GH_OWNER or GH_REPO must be set. "
+            "Set GH_OWNER to auto-discover all repos in an org, or GH_REPO for a single repo."
+        )
 
 
 def family_available(family):

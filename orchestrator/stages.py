@@ -224,7 +224,7 @@ def _pause(gh, n, reason):
                   f"`{config.SIG_RESOLVED}` label).")
     # Baseline: any comment you post AFTER this is detected as fresh input that
     # resumes the paused stage — see process_issue's human:needed gate.
-    update_issue_meta(n, last_comment_seen=max(
+    update_issue_meta(gh.key(n), last_comment_seen=max(
         (c["id"] for c in gh.list_comments(n)), default=0))
 
 
@@ -236,9 +236,9 @@ def handle_summarize(gh, ledger, issue):
                            if not is_bot_comment(c)) or "(none)"
     # Mark every comment seen so far as acted-on, so a NEW human comment later —
     # at the clarify OR the approval gate — is detected as fresh input to revise.
-    update_issue_meta(n, last_comment_seen=max((c["id"] for c in comments), default=0))
+    update_issue_meta(gh.key(n), last_comment_seen=max((c["id"] for c in comments), default=0))
     # Capture the checkout path BEFORE rendering so the general layer is read from the real checkout
-    path = repo.ensure_repo(n)
+    path = repo.ensure_repo(gh, n)
     prompt = _build_prompt(prompts.SUMMARIZE, "summarize", path, NUM=n, TITLE=issue["title"],
                             BODY=issue.get("body") or "(no description)",
                             CLARIFICATIONS=human)
@@ -280,7 +280,7 @@ def handle_clarify(gh, ledger, issue):
     """Re-summarize once the human replies."""
     n = issue["number"]
     latest = gh.latest_human_comment(n)
-    seen = issue_meta(n).get("last_comment_seen", 0)
+    seen = issue_meta(gh.key(n)).get("last_comment_seen", 0)
     if latest and latest["id"] > seen:
         gh.set_flow(n, config.FLOW_SUMMARIZE, issue)   # re-run next tick with the reply
         log(f"[#{n}] clarify: new reply -> flow:summarize")
@@ -296,8 +296,8 @@ def handle_spec(gh, ledger, issue):
     per tick (not all rounds inline) keeps the worker free between rounds so the
     orchestrator stays responsive and a paused issue can resume promptly."""
     n = issue["number"]
-    path = repo.ensure_repo(n)
-    meta = issue_meta(n)
+    path = repo.ensure_repo(gh, n)
+    meta = issue_meta(gh.key(n))
     summary = _last_bot_summary(gh, n)
     guidance = meta.get("human_guidance")
     if guidance:
@@ -318,7 +318,7 @@ def handle_spec(gh, ledger, issue):
     if d.get("status") != "ready" or not d.get("specs"):
         # author stopped before review — a real judgement call, OR output that
         # didn't parse into the json contract (common on long agentic runs).
-        _reset_spec_loop(n)
+        _reset_spec_loop(gh, n)
         why = "output didn't parse" if not d else "author stopped before review"
         log(f"[#{n}] spec round {rnd}: author stopped ({why}) -> escalate (human:needed)")
         _escalate_spec(gh, n, d.get("specs"),
@@ -328,7 +328,7 @@ def handle_spec(gh, ledger, issue):
     specs = d["specs"]
     # Persist the author session for resumption on subsequent rounds
     if res.session_id:
-        update_issue_meta(n, spec_author_session={"family": fam, "id": res.session_id})
+        update_issue_meta(gh.key(n), spec_author_session={"family": fam, "id": res.session_id})
     # the author's replies to last round's concerns (resolved or rebutted)
     responses = "\n".join(f"- {r}" for r in (d.get("responses") or [])) \
         or "(none — first review)"
@@ -345,16 +345,16 @@ def handle_spec(gh, ledger, issue):
     note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
     # Persist the reviewer session for resumption on subsequent rounds
     if rev.session_id:
-        update_issue_meta(n, spec_reviewer_session={"family": rfam, "id": rev.session_id})
+        update_issue_meta(gh.key(n), spec_reviewer_session={"family": rfam, "id": rev.session_id})
     concerns = rev.data.get("concerns") or []
     if rev.data.get("verdict") != "concerns" or not concerns:
-        _reset_spec_loop(n)
+        _reset_spec_loop(gh, n)
         log(f"[#{n}] spec round {rnd}: reviewer approved -> publishing "
             f"{len(specs)} spec(s), flow:implement")
         _publish_specs(gh, n, path, specs, round_note=note)        # reviewer happy
         return
     if rnd >= config.MAX_SPEC_ROUNDS:
-        _reset_spec_loop(n)
+        _reset_spec_loop(gh, n)
         log(f"[#{n}] spec round {rnd}: still {len(concerns)} concern(s) after "
             f"MAX_SPEC_ROUNDS -> escalate (human:needed):")
         for c in concerns:
@@ -368,7 +368,7 @@ def handle_spec(gh, ledger, issue):
     fb = (f"YOUR PREVIOUS DRAFT:\n{_specs_text(specs)}\n\n"
           f"PEER-REVIEW CONCERNS (round {rnd}) to resolve:\n"
           + "\n".join(f"- {c}" for c in concerns))
-    update_issue_meta(n, spec_round=rnd, spec_feedback=fb)
+    update_issue_meta(gh.key(n), spec_round=rnd, spec_feedback=fb)
     concern_list = "\n".join(f"- {c}" for c in concerns)
     gh.comment(n, f"🔁 **Peer review raised {len(concerns)} concern(s)** "
                   f"(round {rnd}) — revising next round:\n{concern_list}\n\n{note}")
@@ -378,8 +378,8 @@ def handle_spec(gh, ledger, issue):
     # stays at flow:spec -> the next tick runs round rnd+1
 
 
-def _reset_spec_loop(n):
-    update_issue_meta(n, spec_round=0, spec_feedback=None,
+def _reset_spec_loop(gh, n):
+    update_issue_meta(gh.key(n), spec_round=0, spec_feedback=None,
                     spec_author_session=None, spec_reviewer_session=None)
 
 
@@ -416,17 +416,22 @@ def _units(meta, flow=None):
     }]
 
 
-def _save_units(n, units):
-    update_issue_meta(n, spec_units=units)
+def _save_units(gh, n, units):
+    update_issue_meta(gh.key(n), spec_units=units)
 
 
-def _update_unit(n, slug, **changes):
+def _update_unit(key, slug, **changes):
     """Update a single unit's fields atomically — for concurrent workers.
 
     Under the store path lock, reload spec_units, update ONLY the unit matching
     `slug`, and save. Each worker persists its own unit without clobbering
     siblings. Uses _load/_save directly to avoid re-acquiring the non-reentrant
     lock (issue_meta/update_issue_meta each acquire the same lock).
+
+    Args:
+        key: The namespaced issue key (e.g. 'owner/repo#5')
+        slug: The spec slug to update
+        **changes: Fields to update on the unit
     """
     from . import store
     lock = store._lock_for(store.ISSUES_PATH)
@@ -434,7 +439,7 @@ def _update_unit(n, slug, **changes):
         # Load, modify, save inline — do NOT call issue_meta() or update_issue_meta()
         # since they re-acquire the same non-reentrant lock and would deadlock.
         data = store._load(store.ISSUES_PATH, {})
-        issue_data = data.get(str(n), {})
+        issue_data = data.get(key, {})
         units = issue_data.get("spec_units", [])
         updated = []
         for u in units:
@@ -445,7 +450,7 @@ def _update_unit(n, slug, **changes):
             else:
                 updated.append(u)
         issue_data["spec_units"] = updated
-        data[str(n)] = issue_data
+        data[key] = issue_data
         store._save(store.ISSUES_PATH, data)
 
 
@@ -484,7 +489,7 @@ def _publish_specs(gh, n, path, specs, round_note=""):
     # Leave the primary on a non-spec ref so `ensure_worktree` never fails with
     # 'branch already checked out in another worktree'.
     repo._git(["checkout", "--detach", f"origin/{base}"], path)
-    update_issue_meta(n, spec_units=units, specs=specs, branch=None,
+    update_issue_meta(gh.key(n), spec_units=units, specs=specs, branch=None,
                       review_round=0, human_guidance=None, pending_specs=None)
     gh.set_flow(n, config.FLOW_IMPLEMENT, gh.get_issue(n))
     lines = "\n".join(f"- `{u['branch']}` — {u['title']}" for u in units)
@@ -499,7 +504,7 @@ def _escalate_spec(gh, n, specs, reason, round_note=""):
     """Judgement call before publish: keep the proposed specs in meta and pause for
     a human (no sub-issues — the specs become branches only once approved)."""
     if specs:
-        update_issue_meta(n, pending_specs=specs)
+        update_issue_meta(gh.key(n), pending_specs=specs)
         titles = "\n".join(f"- {s.get('title', '(untitled)')}" for s in specs)
         reason += f"\n\nProposed specs:\n{titles}"
     if round_note:
@@ -514,7 +519,7 @@ def handle_implement(gh, ledger, issue):
     import concurrent.futures
 
     n = issue["number"]
-    units = _units(issue_meta(n), "implement")
+    units = _units(issue_meta(gh.key(n)), "implement")
     implement_units = [u for u in units if u["stage"] == "implement"]
 
     if not implement_units:                             # nothing left to implement
@@ -526,7 +531,7 @@ def handle_implement(gh, ledger, issue):
     def _implement_one(u):
         """Worker: run one implement unit in a worktree."""
         slug = u["slug"]
-        path = repo.ensure_worktree(n, slug, u["branch"], base)
+        path = repo.ensure_worktree(gh, n, slug, u["branch"], base)
         try:
             rnd = u.get("review_round", 0)
             discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
@@ -549,7 +554,7 @@ def handle_implement(gh, ledger, issue):
 
             # Persist the implement session for resumption on fix rounds
             if res.session_id:
-                _update_unit(n, slug, implement_session={"family": fam, "id": res.session_id})
+                _update_unit(gh.key(n), slug, implement_session={"family": fam, "id": res.session_id})
 
             repo.commit_all(path, f"implement #{n} {slug}"
                             + (f" (fix round {rnd})" if rnd else ""))
@@ -563,7 +568,7 @@ def handle_implement(gh, ledger, issue):
             return {"slug": slug, "status": "done", "pr_number": pr["number"],
                     "implementer": fam}
         finally:
-            repo.remove_worktree(n, path)
+            repo.remove_worktree(gh, n, path)
 
     # Fan-out: process all implement units concurrently.
     results = []
@@ -589,7 +594,7 @@ def handle_implement(gh, ledger, issue):
     for r in results:
         if r["status"] == "done":
             slug = r["slug"]
-            _update_unit(n, slug, pr_number=r["pr_number"],
+            _update_unit(gh.key(n), slug, pr_number=r["pr_number"],
                          implementer=r["implementer"], stage="review")
             log(f"[#{n}] implement {slug}: done by {r['implementer']} -> PR #{r['pr_number']}")
         elif r["status"] == "parked":
@@ -611,7 +616,7 @@ def handle_implement(gh, ledger, issue):
         combined = "\n\n".join(escalation_reasons)
         _pause(gh, n, f"One or more implement units hit a blocker:\n\n{combined}")
     else:
-        _advance(gh, n, _units(issue_meta(n)), issue)
+        _advance(gh, n, _units(issue_meta(gh.key(n))), issue)
 
 
 def handle_review(gh, ledger, issue):
@@ -620,7 +625,7 @@ def handle_review(gh, ledger, issue):
     import concurrent.futures
 
     n = issue["number"]
-    units = _units(issue_meta(n), "review")
+    units = _units(issue_meta(gh.key(n)), "review")
     review_units = [u for u in units if u["stage"] == "review"]
 
     if not review_units:                                # nothing left to review
@@ -633,7 +638,7 @@ def handle_review(gh, ledger, issue):
     def _review_one(u):
         """Worker: run one review unit in a worktree."""
         slug = u["slug"]
-        path = repo.ensure_worktree(n, slug, u["branch"], base)
+        path = repo.ensure_worktree(gh, n, slug, u["branch"], base)
         try:
             discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
             prompt = _build_prompt(prompts.REVIEW, "review", path, NUM=n, TITLE=issue["title"],
@@ -667,7 +672,7 @@ def handle_review(gh, ledger, issue):
                 return {"slug": slug, "status": "escalate",
                         "reason": _failure_reason(res, "Review flagged a judgement call.")}
         finally:
-            repo.remove_worktree(n, path)
+            repo.remove_worktree(gh, n, path)
 
     # Fan-out: process all review units concurrently.
     results = []
@@ -698,14 +703,14 @@ def handle_review(gh, ledger, issue):
             # Review feedback goes on the PR (the code under review), not the issue.
             gh.comment(pr_number, f"✅ **Review passed** (by {r['family']}).\n\n{r['summary']}",
                        model=r["model"], effort=r["effort"], tokens=r["tokens"])
-            _update_unit(n, slug, stage="merge")
+            _update_unit(gh.key(n), slug, stage="merge")
             log(f"[#{n}] review {slug}: approved by {r['family']}")
         elif r["status"] == "request_changes":
             # Review feedback goes on the PR (the code under review), not the issue.
             gh.comment(pr_number, f"🔁 **Changes requested** (round {r['round']}, "
                        f"by {r['family']}):\n{r['feedback']}",
                        model=r["model"], effort=r["effort"], tokens=r["tokens"])
-            _update_unit(n, slug, review_round=r["round"],
+            _update_unit(gh.key(n), slug, review_round=r["round"],
                          last_feedback=r["feedback"], stage="implement")
             log(f"[#{n}] review {slug}: changes requested (round {r['round']}, by {r['family']})")
         elif r["status"] == "escalate":
@@ -726,13 +731,13 @@ def handle_review(gh, ledger, issue):
         combined = "\n\n".join(escalation_reasons)
         _pause(gh, n, f"One or more review units hit a blocker:\n\n{combined}")
     else:
-        _advance(gh, n, _units(issue_meta(n)), issue)
+        _advance(gh, n, _units(issue_meta(gh.key(n))), issue)
 
 
 def handle_merge(gh, ledger, issue):
     """Merge (or await) every approved spec PR; close the issue when all are in."""
     n = issue["number"]
-    units = _units(issue_meta(n), "merge")
+    units = _units(issue_meta(gh.key(n)), "merge")
     changed = False
     for u in units:
         if u["stage"] == "done" or not u.get("pr_number"):
@@ -749,7 +754,7 @@ def handle_merge(gh, ledger, issue):
             changed = True
             log(f"[#{n}] merge: auto-merged PR #{pr.get('number')} ({u['slug']})")
     if changed:
-        _save_units(n, units)
+        _save_units(gh, n, units)
     pending = [u for u in units if u["stage"] != "done"]
     if not pending:
         _advance(gh, n, units, issue)                    # all merged -> close issue

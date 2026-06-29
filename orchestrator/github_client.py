@@ -25,15 +25,66 @@ def is_bot_comment(comment):
     return bool(_BOT_MARKER.search(comment.get("body") or ""))
 
 
+def discover_repos(owner, token):
+    """Enumerate all non-archived repos in a GitHub org.
+
+    Paginates through /orgs/{owner}/repos and returns a list of full_name strings.
+    Skips archived repos (read-only; can't host PRs). Raises on API errors.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    repos = []
+    page = 1
+    while True:
+        r = s.get(f"{API}/orgs/{owner}/repos",
+                  params={"type": "all", "per_page": 100, "page": page})
+        r.raise_for_status()
+        batch = r.json()
+        for repo in batch:
+            if not repo.get("archived"):
+                repos.append(repo["full_name"])
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
 class GitHub:
-    def __init__(self, repo=config.GH_REPO, token=config.GH_TOKEN):
+    def __init__(self, repo, token=None):
+        if token is None:
+            token = config.GH_TOKEN
         self.repo = repo
+        # Derive per-repo identity for namespacing
+        if "/" not in repo:
+            raise ValueError(f"Invalid repo format: {repo}. Expected 'owner/name'.")
+        self.owner, self.name = repo.split("/", 1)
+        self.remote = f"https://x-access-token:{token}@github.com/{repo}.git"
         self.s = requests.Session()
         self.s.headers.update({
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         })
+
+    def key(self, n):
+        """The namespaced store key for issue n in this repo.
+
+        Returns '{owner/name}#n' (e.g. 'ZabelTech/foo#5'). This is the key used
+        in issues.json to prevent collisions when two repos have issue #5.
+        """
+        return f"{self.repo}#{n}"
+
+    def slug_n(self, n):
+        """The filesystem-safe slug for issue n in this repo.
+
+        Returns 'owner-name-n' (e.g. 'ZabelTech-foo-5'). This is used for workdir
+        paths and git lock names to prevent collisions.
+        """
+        return f"{self.owner}-{self.name}-{n}"
 
     def _u(self, path):
         return f"{API}/repos/{self.repo}{path}"
@@ -141,8 +192,7 @@ class GitHub:
         return self._get(f"/pulls/{number}")
 
     def pull_for_branch(self, head_branch):
-        owner = self.repo.split("/")[0]
-        res = self._get("/pulls", params={"head": f"{owner}:{head_branch}", "state": "all"})
+        res = self._get("/pulls", params={"head": f"{self.owner}:{head_branch}", "state": "all"})
         return res[0] if res else None
 
     def pull_diff(self, number):
