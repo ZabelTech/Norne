@@ -208,9 +208,13 @@ class ClaudeCodeRunner:
         # with a session-not-found error, retry once without --resume
         if (resume and res is not None and res.returncode != 0 and
                 _SESSION_NOT_FOUND_HINT.search(blob)):
-            # Retry without --resume for a fresh session
-            retry_cmd = [c for i, c in enumerate(cmd) if c not in ("--resume", resume) or
-                         (i > 0 and cmd[i-1] != "--resume")]
+            # Retry without --resume for a fresh session: rebuild the command without
+            # the --resume flag and its value (cmd has ["--resume", resume] at the end)
+            try:
+                resume_idx = cmd.index("--resume")
+                retry_cmd = cmd[:resume_idx] + cmd[resume_idx+2:]
+            except ValueError:
+                retry_cmd = cmd
             res, blob = _run(retry_cmd, cwd, env, "claude")
         if res is None:                                   # timed out
             return RunResult(ok=False, text="", raw=blob)
@@ -245,9 +249,13 @@ class GlmClaudeCodeRunner:
         # with a session-not-found error, retry once without --resume
         if (resume and res is not None and res.returncode != 0 and
                 _SESSION_NOT_FOUND_HINT.search(blob)):
-            # Retry without --resume for a fresh session
-            retry_cmd = [c for i, c in enumerate(cmd) if c not in ("--resume", resume) or
-                         (i > 0 and cmd[i-1] != "--resume")]
+            # Retry without --resume for a fresh session: rebuild the command without
+            # the --resume flag and its value (cmd has ["--resume", resume] at the end)
+            try:
+                resume_idx = cmd.index("--resume")
+                retry_cmd = cmd[:resume_idx] + cmd[resume_idx+2:]
+            except ValueError:
+                retry_cmd = cmd
             res, blob = _run(retry_cmd, cwd, env, "glm")
         if res is None:                                   # timed out
             return RunResult(ok=False, text="", raw=blob)
