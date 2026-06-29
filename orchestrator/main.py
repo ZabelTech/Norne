@@ -141,8 +141,11 @@ def dispatch_once(gh_clients, executor, ledger, inflight, lock):
     """
     cands = []
     for gh in gh_clients:
-        for issue in candidates(gh):
-            cands.append((gh, issue))
+        try:
+            for issue in candidates(gh):
+                cands.append((gh, issue))
+        except Exception as e:
+            log(f"poll: skipping {gh.repo} — list_issues failed: {e}")
     dispatched, busy = [], []
     for gh, issue in cands:
         n = issue["number"]
@@ -222,13 +225,14 @@ def main():
                 try:
                     repo_slugs = discover_repos(config.GH_OWNER, config.GH_TOKEN)
                     last_discovered = list(repo_slugs)
-                    # Rebuild clients if the repo list changed
-                    if len(repo_slugs) != len(gh_clients):
+                    # Rebuild clients if the repo set changed (compare by content,
+                    # not just length, so add+remove or renames are caught)
+                    if repo_slugs != [c.repo for c in gh_clients]:
                         gh_clients = [GitHub(repo, config.GH_TOKEN) for repo in repo_slugs]
                         log(f"Repo list changed: now {len(repo_slugs)} repos")
                 except Exception as e:
                     log(f"Discovery failed: {e}. Using cached list.")
-                    if last_discovered and len(last_discovered) != len(gh_clients):
+                    if last_discovered and last_discovered != [c.repo for c in gh_clients]:
                         gh_clients = [GitHub(repo, config.GH_TOKEN) for repo in last_discovered]
 
             dispatch_once(gh_clients, executor, ledger, inflight, lock)

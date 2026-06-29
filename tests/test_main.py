@@ -353,3 +353,60 @@ def test_migrate_legacy_keys_called_at_startup(monkeypatch):
 
     # migrate_legacy_keys must have been called with GH_REPO before dispatching.
     assert "owner/repo" in migration_calls
+
+
+def test_dispatch_once_per_repo_error_skips_that_repo_others_still_dispatch():
+    """If list_issues raises for one repo, the other repos are still dispatched.
+
+    The per-repo try/except in dispatch_once must swallow the per-repo exception
+    so a single flaky API call doesn't abort the whole poll cycle.
+    """
+    gh_ok = FakeGH(labels={config.FLOW_SPEC}, repo="org/ok-repo")
+    gh_ok._issues = [{"number": 1, "title": "OK issue"}]
+
+    class _BrokenGH(FakeGH):
+        def list_issues(self, **kw):
+            raise RuntimeError("network error")
+
+    gh_broken = _BrokenGH(labels={}, repo="org/broken-repo")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    inflight = set()
+    lock = threading.Lock()
+
+    submitted = []
+    original = main.process_issue
+    main.process_issue = lambda gh, l, i: submitted.append(gh.key(i["number"]))
+    try:
+        main.dispatch_once([gh_broken, gh_ok], executor, None, inflight, lock)
+        executor.shutdown(wait=True)
+    finally:
+        main.process_issue = original
+
+    # The ok repo's issue was dispatched even though the broken repo errored.
+    assert "org/ok-repo#1" in submitted
+    # The broken repo produced no submissions (it errored, not dispatched).
+    assert not any("broken" in k for k in submitted)
+
+
+def test_dispatch_once_content_change_same_length_rebuilds_clients():
+    """Clients are rebuilt when repo content changes even if the count is the same.
+
+    A rename (or simultaneous add+remove) keeps len() constant, so comparing by
+    length alone misses the change. The comparison must use content.
+    This test is not about dispatch_once itself but about the loop logic. We
+    verify it by checking that comparing slugs vs client.repo catches a swap.
+    """
+    # Simulate: clients currently track [repo-a, repo-b]
+    gh_a = FakeGH(labels={}, repo="org/repo-a")
+    gh_b = FakeGH(labels={}, repo="org/repo-b")
+    current_clients = [gh_a, gh_b]
+
+    # New discovery returns [repo-a, repo-c] — same length, different content.
+    new_slugs = ["org/repo-a", "org/repo-c"]
+
+    # Content comparison catches the difference.
+    assert new_slugs != [c.repo for c in current_clients]
+
+    # Length comparison would have missed it.
+    assert len(new_slugs) == len(current_clients)

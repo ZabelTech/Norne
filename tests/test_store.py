@@ -309,16 +309,22 @@ def test_migrate_legacy_keys_leaves_namespaced_keys_untouched(ledger_paths):
 
 
 def test_migrate_legacy_keys_without_slug_warns_and_leaves_bare_keys(ledger_paths, caplog):
-    """When repo_slug is None, bare keys are left and a warning is logged."""
+    """When repo_slug is None, bare keys are left and a single consolidated warning is logged."""
     import logging
     store.update_issue_meta("7", branch="b")
+    store.update_issue_meta("9", branch="c")
 
     with caplog.at_level(logging.WARNING, logger="root"):
         migrated, _ = store.migrate_legacy_keys(None)
 
     assert migrated == []
     assert store.issue_meta("7") == {"branch": "b"}   # untouched
-    assert any("7" in rec.message for rec in caplog.records)
+    assert store.issue_meta("9") == {"branch": "c"}   # untouched
+    # Single warning listing all affected keys (not one per key)
+    warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warn_records) == 1
+    assert "7" in warn_records[0].message
+    assert "9" in warn_records[0].message
 
 
 def test_migrate_two_bare_keys_both_converted(ledger_paths):

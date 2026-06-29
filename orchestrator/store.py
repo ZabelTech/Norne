@@ -88,6 +88,7 @@ def migrate_legacy_keys(repo_slug):
         data = _load(ISSUES_PATH, {})
         migrated = []
         skipped = []
+        bare_without_slug = []
         for key in list(data.keys()):
             if "#" in key:
                 # Already namespaced — skip
@@ -97,19 +98,21 @@ def migrate_legacy_keys(repo_slug):
                 # Not a bare integer — skip
                 skipped.append(key)
                 continue
-            # Bare integer key — migrate
+            # Bare integer key — migrate or collect for warning
             if repo_slug is None:
-                import logging
-                logging.warning(
-                    f"Cannot migrate legacy bare key '{key}' without repo_slug. "
-                    f"Set GH_REPO to enable migration. Leaving key untouched."
-                )
+                bare_without_slug.append(key)
                 continue
             new_key = f"{repo_slug}#{key}"
             value = data[key]
             data[new_key] = value
             del data[key]
             migrated.append((key, new_key))
+        if bare_without_slug:
+            import logging
+            logging.warning(
+                f"Cannot migrate legacy bare key(s) {bare_without_slug} without repo_slug. "
+                f"Set GH_REPO to enable migration. Leaving them untouched."
+            )
         if migrated:
             _save(ISSUES_PATH, data)
         return migrated, skipped
