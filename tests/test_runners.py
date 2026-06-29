@@ -86,10 +86,11 @@ def test_claude_cc_json_parses_result_and_usage():
         "result": "the answer",
         "usage": {"input_tokens": 100, "output_tokens": 30},
     })
-    text, itok, otok = runners._claude_cc_json(line)
+    text, itok, otok, structured = runners._claude_cc_json(line)
     assert text == "the answer"
     assert itok == 100
     assert otok == 30
+    assert structured is None                            # no --json-schema run
 
 
 def test_claude_cc_json_discounts_cache_reads_and_counts_cache_writes():
@@ -99,7 +100,7 @@ def test_claude_cc_json_discounts_cache_reads_and_counts_cache_writes():
         "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20,
                   "cache_read_input_tokens": 900, "output_tokens": 5},
     })
-    _, itok, otok = runners._claude_cc_json(line)
+    _, itok, otok, _ = runners._claude_cc_json(line)
     assert itok == 10 + 20 + int(0.1 * 900)              # 10 + 20 + 90 = 120
     assert otok == 5
 
@@ -112,34 +113,71 @@ def test_claude_cc_json_cache_read_heavy_run_is_not_over_counted():
         "usage": {"input_tokens": 1000, "cache_read_input_tokens": 5_000_000,
                   "output_tokens": 2000},
     })
-    _, itok, _ = runners._claude_cc_json(line)
+    _, itok, _, _ = runners._claude_cc_json(line)
     assert itok == 1000 + int(0.1 * 5_000_000)           # 501000, not 5_001_000
     assert itok < 600_000
 
 
 def test_claude_cc_json_uses_last_line():
     stdout = "noise\n" + json.dumps({"result": "final", "usage": {}})
-    text, itok, otok = runners._claude_cc_json(stdout)
+    text, itok, otok, _ = runners._claude_cc_json(stdout)
     assert text == "final"
     assert (itok, otok) == (0, 0)
 
 
 def test_claude_cc_json_falls_back_on_garbage():
-    text, itok, otok = runners._claude_cc_json("not json at all")
+    text, itok, otok, structured = runners._claude_cc_json("not json at all")
     assert text == "not json at all"
     assert (itok, otok) == (0, 0)
+    assert structured is None
 
 
 def test_claude_cc_json_handles_empty():
-    text, itok, otok = runners._claude_cc_json("")
-    assert (text, itok, otok) == ("", 0, 0)
+    text, itok, otok, structured = runners._claude_cc_json("")
+    assert (text, itok, otok, structured) == ("", 0, 0, None)
 
 
 def test_claude_cc_json_prefers_text_key_when_no_result():
     line = json.dumps({"text": "fallback", "usage": {"output_tokens": 2}})
-    text, _, otok = runners._claude_cc_json(line)
+    text, _, otok, _ = runners._claude_cc_json(line)
     assert text == "fallback"
     assert otok == 2
+
+
+def test_claude_cc_json_returns_structured_output_when_present():
+    # A --json-schema run: the envelope carries a parsed `structured_output`.
+    line = json.dumps({
+        "result": '{"status": "ok", "n": 3}',
+        "structured_output": {"status": "ok", "n": 3},
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    })
+    text, _, _, structured = runners._claude_cc_json(line)
+    assert text == '{"status": "ok", "n": 3}'
+    assert structured == {"status": "ok", "n": 3}
+
+
+# ── _data_from: structured_output wins, text parse is the fallback ───────────
+def test_data_from_prefers_structured_output():
+    structured = {"status": "ready", "n": 1}
+    # Even with a different (stale) fenced block in the text, structured wins.
+    text = '```json\n{"status": "stale"}\n```'
+    assert runners._data_from(text, structured) == structured
+
+
+def test_data_from_falls_back_to_text_when_no_structured():
+    text = '```json\n{"status": "ready"}\n```'
+    assert runners._data_from(text, None) == {"status": "ready"}
+
+
+def test_data_from_falls_back_when_structured_is_empty():
+    # An empty dict isn't a usable result — parse the text instead.
+    text = 'prose\n{"status": "done"}'
+    assert runners._data_from(text, {}) == {"status": "done"}
+
+
+def test_data_from_ignores_non_dict_structured():
+    text = '{"status": "done"}'
+    assert runners._data_from(text, ["not", "a", "dict"]) == {"status": "done"}
 
 
 # ── rate-limit sniffer ──────────────────────────────────────────────────────
@@ -245,3 +283,72 @@ def test_glm_runner_survives_a_timeout(monkeypatch):
     res = runners.GlmClaudeCodeRunner().run("PROMPT", cwd=".", model="glm-4.7")
     assert res.ok is False
     assert res.raw == "timeout"
+
+
+# ── --json-schema wiring ─────────────────────────────────────────────────────
+class _FakeProc:
+    def __init__(self, stdout, returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _capture_run(captured):
+    """A fake runners._run that records the cmd and returns a canned envelope
+    carrying a parsed structured_output."""
+    envelope = json.dumps({
+        "result": '{"status": "ready"}',
+        "structured_output": {"status": "ready"},
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+
+    def fake(cmd, cwd, env, pool):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return _FakeProc(envelope), "blob"
+    return fake
+
+
+def test_claude_runner_passes_json_schema_inline(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(runners, "_run", _capture_run(captured))
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    schema = {"type": "object", "properties": {"status": {"type": "string"}}}
+    res = runners.ClaudeCodeRunner().run("PROMPT", cwd=".", model="claude-opus-4-8",
+                                         schema=schema)
+    cmd = captured["cmd"]
+    assert "--json-schema" in cmd
+    # The schema is passed INLINE as a JSON string (not a file path).
+    inline = cmd[cmd.index("--json-schema") + 1]
+    assert json.loads(inline) == schema
+    # structured_output flows through to RunResult.data.
+    assert res.data == {"status": "ready"}
+
+
+def test_claude_runner_omits_json_schema_when_none(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(runners, "_run", _capture_run(captured))
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    runners.ClaudeCodeRunner().run("PROMPT", cwd=".", model="claude-opus-4-8")
+    assert "--json-schema" not in captured["cmd"]
+
+
+def test_claude_runner_accepts_prebuilt_schema_string(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(runners, "_run", _capture_run(captured))
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    runners.ClaudeCodeRunner().run("PROMPT", cwd=".", schema='{"type":"object"}')
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--json-schema") + 1] == '{"type":"object"}'
+
+
+def test_glm_runner_never_forwards_json_schema(monkeypatch):
+    # z.ai may not honor the flag — GLM relies on the tolerant parser, so the
+    # schema must NOT reach the cmd even when one is passed.
+    captured = {}
+    monkeypatch.setattr(runners, "_run", _capture_run(captured))
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")
+    res = runners.GlmClaudeCodeRunner().run("PROMPT", cwd=".", model="glm-4.7",
+                                            schema={"type": "object"})
+    assert "--json-schema" not in captured["cmd"]
+    # It still reads structured_output if the endpoint happens to return it.
+    assert res.data == {"status": "ready"}

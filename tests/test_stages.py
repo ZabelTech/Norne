@@ -133,9 +133,9 @@ class StubRunner:
         self._result = result
         self.seen = {}
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
         self.seen = {"prompt": prompt, "cwd": cwd, "write": write,
-                     "model": model, "effort": effort}
+                     "model": model, "effort": effort, "schema": schema}
         return self._result
 
 
@@ -248,7 +248,7 @@ class _RLRunner:
         self.family = family
         self._rl = rate_limited
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
         if self.family in self._rl:
             raise stages.RateLimited(self.family)
         return RunResult(ok=True, text="", input_tokens=1, output_tokens=1)

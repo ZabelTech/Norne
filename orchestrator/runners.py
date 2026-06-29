@@ -146,31 +146,43 @@ def _apply_effort(prompt, effort, write=False):
 
 
 def _claude_cc_json(stdout):
-    """Parse `claude -p --output-format json` -> (final_text, in_tok, out_tok).
+    """Parse `claude -p --output-format json` -> (final_text, in_tok, out_tok,
+    structured). `structured` is the envelope's `structured_output` field — the
+    parsed object the CLI returns when run with `--json-schema` (None otherwise);
+    callers prefer it over re-parsing the text.
 
     `in_tok` is an *effective* input count for the budget gate: fresh input +
     cache-creation at full weight, plus cache-READS weighted down
     (config.CLAUDE_CACHE_READ_WEIGHT). Cache reads are re-counted every turn and
     priced ~0.1x, so charging them at 1x over-counts a long agentic run ~10x vs
     the real subscription — the bug that wrongly parked Claude."""
-    text, itok, otok = "", 0, 0
+    text, itok, otok, structured = "", 0, 0, None
     try:
         obj = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
     except (json.JSONDecodeError, IndexError):
-        return stdout, 0, 0
+        return stdout, 0, 0, None
     text = obj.get("result") or obj.get("text") or ""
     usage = obj.get("usage") or {}
     itok = (usage.get("input_tokens", 0)
             + usage.get("cache_creation_input_tokens", 0)
             + int(config.CLAUDE_CACHE_READ_WEIGHT * usage.get("cache_read_input_tokens", 0)))
     otok = usage.get("output_tokens", 0)
-    return text, itok, otok
+    structured = obj.get("structured_output")
+    return text, itok, otok, structured
+
+
+def _data_from(text, structured):
+    """The parsed result object for a run: prefer the CLI's `structured_output`
+    (constrained by `--json-schema`), else the tolerant parse of the final text."""
+    if isinstance(structured, dict) and structured:
+        return structured
+    return parse_structured(text)
 
 
 class ClaudeCodeRunner:
     family = "claude"
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
         env = _base_env()
         env["CLAUDE_CODE_OAUTH_TOKEN"] = config.CLAUDE_CODE_OAUTH_TOKEN
         env.pop("ANTHROPIC_BASE_URL", None)
@@ -178,13 +190,19 @@ class ClaudeCodeRunner:
         prompt, max_turns = _apply_effort(prompt, effort, write=write)
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns)]
+        # Constrain the result to schema-valid JSON (and get a parsed
+        # `structured_output` back). The flag takes the schema INLINE as a string.
+        if schema:
+            cmd += ["--json-schema",
+                    schema if isinstance(schema, str) else json.dumps(schema)]
         if model:
             cmd += ["--model", model]
         res, blob = _run(cmd, cwd, env, "claude")
         if res is None:                                   # timed out
             return RunResult(ok=False, text="", raw=blob)
-        text, itok, otok = _claude_cc_json(res.stdout)
-        return RunResult(ok=res.returncode == 0, text=text, data=parse_structured(text),
+        text, itok, otok, structured = _claude_cc_json(res.stdout)
+        return RunResult(ok=res.returncode == 0, text=text,
+                         data=_data_from(text, structured),
                          input_tokens=itok, output_tokens=otok, raw=blob)
 
 
@@ -192,21 +210,26 @@ class GlmClaudeCodeRunner:
     """GLM via Claude Code pointed at z.ai (Anthropic-compatible endpoint)."""
     family = "glm"
 
-    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium"):
+    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium", schema=None):
         env = _base_env()
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)          # use z.ai, not Anthropic
         env["ANTHROPIC_BASE_URL"] = config.ZAI_BASE_URL
         env["ANTHROPIC_AUTH_TOKEN"] = config.ZAI_AUTH_TOKEN
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         prompt, max_turns = _apply_effort(prompt, effort, write=write)
+        # NB: `schema` is intentionally NOT forwarded as `--json-schema` here —
+        # z.ai's Anthropic-compatible endpoint may not honor the output_config
+        # the flag adds, so we rely on the tolerant parser instead (the schema is
+        # accepted for a uniform runner signature).
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--permission-mode", "bypassPermissions", "--max-turns", str(max_turns),
                "--model", model]
         res, blob = _run(cmd, cwd, env, "glm")
         if res is None:                                   # timed out
             return RunResult(ok=False, text="", raw=blob)
-        text, itok, otok = _claude_cc_json(res.stdout)
-        return RunResult(ok=res.returncode == 0, text=text, data=parse_structured(text),
+        text, itok, otok, structured = _claude_cc_json(res.stdout)
+        return RunResult(ok=res.returncode == 0, text=text,
+                         data=_data_from(text, structured),
                          input_tokens=itok, output_tokens=otok, raw=blob)
 
 
@@ -221,7 +244,7 @@ class GlmPiRunner:
     """
     family = "glm"
 
-    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium"):
+    def run(self, prompt, cwd, write=False, model="glm-4.7", effort="medium", schema=None):
         env = _base_env()
         env["PI_MODEL"] = model
         prompt, _ = _apply_effort(prompt, effort)   # Pi has no max-turns flag here

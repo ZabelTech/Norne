@@ -136,7 +136,7 @@ def _record(ledger, fam, res):
         ledger.record("glm", prompts=math.ceil(config.GLM_QUOTA_MULTIPLIER))
 
 
-def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
+def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False, schema=None):
     """Route -> reserve -> run -> reconcile. Reserve pre-charges an estimate so
     the budget gate is atomic under concurrent runs; reconcile corrects to actual
     usage after. When a family is actually rate-limited by its provider, refund
@@ -169,7 +169,8 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
         t0 = time.time()
         runner = runners.get_runner(fam)
         try:
-            res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
+            res = runner.run(prompt, cwd=cwd, write=write, model=model,
+                             effort=effort, schema=schema)
         except RateLimited:
             # The run didn't happen: refund the reservation, cool the pool, fall back.
             ledger.reconcile(fam, reserved_tokens=reserved_tokens,
@@ -236,7 +237,8 @@ def handle_summarize(gh, ledger, issue):
                             BODY=issue.get("body") or "(no description)",
                             CLARIFICATIONS=human)
     # Run inside a checkout so the model can investigate the repo, not just /data.
-    fam, res = _run("summarize", ledger, prompt, cwd=path)
+    fam, res = _run("summarize", ledger, prompt, cwd=path,
+                    schema=prompts.SUMMARIZE_SCHEMA)
     model = _model_for("summarize", fam)
     effort = config.effort_for(model)
     d = res.data
@@ -300,7 +302,7 @@ def handle_spec(gh, ledger, issue):
 
     fam, res = _run("spec", ledger, _build_prompt(prompts.SPEC, "spec", path, NUM=n,
                     TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
-                    FEEDBACK=feedback), cwd=path)
+                    FEEDBACK=feedback), cwd=path, schema=prompts.SPEC_SCHEMA)
     author = _participant("spec", fam, res)
     d = res.data
     if d.get("status") != "ready" or not d.get("specs"):
@@ -322,7 +324,7 @@ def handle_spec(gh, ledger, issue):
     rfam, rev = _run("review", ledger, _build_prompt(prompts.SPEC_REVIEW,
                      "spec_review", path, SPECS=_specs_text(specs),
                      AUTHOR_RESPONSES=responses, DISCUSSION=discussion),
-                     cwd=path, exclude_family=fam)
+                     cwd=path, exclude_family=fam, schema=prompts.SPEC_REVIEW_SCHEMA)
     reviewer = _participant("review", rfam, rev)
     note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
     concerns = rev.data.get("concerns") or []
@@ -516,7 +518,8 @@ def handle_implement(gh, ledger, issue):
                                        DISCUSSION=discussion)
             log(f"[#{n}] implement {slug}: "
                 f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
-            fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
+            fam, res = _run("implement", ledger, prompt, cwd=path, write=True,
+                            schema=prompts.IMPLEMENT_SCHEMA)
 
             if res.data.get("status") != "done":
                 reason = _implement_escalation(res, path, base)
@@ -612,7 +615,8 @@ def handle_review(gh, ledger, issue):
                                    BRANCH=u["branch"], BASE=base, DISCUSSION=discussion)
             # cross-check: review with the OTHER family than implemented
             fam, res = _run("review", ledger, prompt, cwd=path,
-                            exclude_family=u.get("implementer"))
+                            exclude_family=u.get("implementer"),
+                            schema=prompts.REVIEW_SCHEMA)
 
             model = _model_for("review", fam)
             effort = config.effort_for(model)

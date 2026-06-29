@@ -188,3 +188,88 @@ End with exactly one json block:
  "comments": ["<specific change requests, if any>"],
  "reason": "<only if needs_human>"}
 ```"""
+
+
+# ── Output schemas ───────────────────────────────────────────────────────────
+# A JSON Schema per stage, matching the trailing json contract each template
+# asks for. Passed to the Claude Code CLI via `--json-schema` so the model's
+# result is *constrained* to schema-valid JSON at decode time (and the run's
+# JSON envelope carries a parsed `structured_output` we read directly), instead
+# of relying on the model to hand-format a fenced block. `required` lists only
+# the truly-required fields; conditional fields (reason/questions/comments) stay
+# optional. The tolerant parser (runners.parse_structured) remains the fallback
+# for GLM and any run that doesn't return `structured_output`.
+_STR = {"type": "string"}
+_STR_LIST = {"type": "array", "items": {"type": "string"}}
+
+SUMMARIZE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["clarify", "ready"]},
+        "summary": _STR,
+        "questions": _STR_LIST,
+    },
+    "required": ["status", "summary"],
+}
+
+SPEC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "needs_human"]},
+        "reason": _STR,
+        "responses": _STR_LIST,
+        "specs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": _STR,
+                    "slug": _STR,
+                    "body": _STR,
+                    "work_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"title": _STR, "body": _STR},
+                            "required": ["title"],
+                        },
+                    },
+                },
+                "required": ["title", "slug", "body"],
+            },
+        },
+    },
+    "required": ["status"],
+}
+
+SPEC_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ok", "concerns"]},
+        "concerns": _STR_LIST,
+    },
+    "required": ["verdict"],
+}
+
+# IMPLEMENT and FIX share one contract: {status, summary, reason}.
+IMPLEMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "needs_human"]},
+        "summary": _STR,
+        "reason": _STR,
+    },
+    "required": ["status"],
+}
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string",
+                   "enum": ["approve", "request_changes", "needs_human"]},
+        "summary": _STR,
+        "comments": _STR_LIST,
+        "reason": _STR,
+    },
+    "required": ["status"],
+}
