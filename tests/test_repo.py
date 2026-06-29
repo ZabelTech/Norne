@@ -153,3 +153,44 @@ def test_per_issue_git_lock_isolation():
     # Same issue should get the same lock (cached).
     lock1_again = repo._repo_lock_for(1)
     assert lock1 is lock1_again
+
+
+# ── commit_all: something to commit path doesn't raise ─────────────────────────
+def test_commit_all_with_something_to_commit(monkeypatch, tmp_path):
+    """commit_all when there are staged changes must not raise.
+
+    git diff --cached --quiet exits 1 when there ARE staged changes. With
+    check=False (the default), this should not raise CalledProcessError.
+    """
+    from subprocess import CompletedProcess
+    import os
+
+    # Fake work path
+    work_path = str(tmp_path / "work")
+    os.makedirs(work_path)
+
+    git_calls = []
+
+    def fake_git(args, cwd, check=False, capture_output=True, text=True):
+        git_calls.append((args, cwd, check))
+        if "diff" in args and "--cached" in args and "--quiet" in args:
+            # git diff --cached --quiet exits 1 when there ARE staged changes
+            return CompletedProcess(["git"] + args, returncode=1, stdout="", stderr="")
+        elif "commit" in args:
+            return CompletedProcess(["git"] + args, returncode=0, stdout="", stderr="")
+        return CompletedProcess(["git"] + args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(repo.subprocess, "run", fake_git)
+
+    # This should NOT raise — check=False means returncode is inspected, not asserted.
+    repo.commit_all(work_path, "test commit")
+
+    # Verify the calls were made with check=False (default).
+    diff_calls = [c for c in git_calls if "diff" in c[0] and "--cached" in c[0]]
+    assert len(diff_calls) == 1
+    # The check parameter should be False (not the check=True that would raise).
+    assert diff_calls[0][2] is False
+
+    # Verify commit was called (because there was something to commit).
+    commit_calls = [c for c in git_calls if "commit" in c[0]]
+    assert len(commit_calls) == 1

@@ -27,7 +27,7 @@ def _repo_lock_for(n):
         return _repo_locks[n]
 
 
-def _git(args, cwd, check=True, capture_output=True):
+def _git(args, cwd, check=False, capture_output=True):
     """Run a git command. Returns the CompletedProcess instance."""
     return subprocess.run(["git"] + args, cwd=cwd, check=check,
                          capture_output=capture_output, text=True)

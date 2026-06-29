@@ -377,12 +377,17 @@ def _update_unit(n, slug, **changes):
 
     Under the store path lock, reload spec_units, update ONLY the unit matching
     `slug`, and save. Each worker persists its own unit without clobbering
-    siblings.
+    siblings. Uses _load/_save directly to avoid re-acquiring the non-reentrant
+    lock (issue_meta/update_issue_meta each acquire the same lock).
     """
     from . import store
     lock = store._lock_for(store.ISSUES_PATH)
     with lock:
-        units = store.issue_meta(n).get("spec_units", [])
+        # Load, modify, save inline — do NOT call issue_meta() or update_issue_meta()
+        # since they re-acquire the same non-reentrant lock and would deadlock.
+        data = store._load(store.ISSUES_PATH, {})
+        issue_data = data.get(str(n), {})
+        units = issue_data.get("spec_units", [])
         updated = []
         for u in units:
             if u.get("slug") == slug:
@@ -391,7 +396,9 @@ def _update_unit(n, slug, **changes):
                 updated.append(updated_u)
             else:
                 updated.append(u)
-        store.update_issue_meta(n, spec_units=updated)
+        issue_data["spec_units"] = updated
+        data[str(n)] = issue_data
+        store._save(store.ISSUES_PATH, data)
 
 
 def _advance(gh, n, units, issue=None):

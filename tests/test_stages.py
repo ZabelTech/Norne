@@ -666,3 +666,31 @@ def test_summarize_still_posts_real_questions(monkeypatch):
     assert gh.flow == stages.config.FLOW_CLARIFY
     body = "\n".join(gh.comments)
     assert "Which tier?" in body and "Worktrees ok?" in body
+
+
+# ── _update_unit: no deadlock, persists correctly ───────────────────────────
+def test_update_unit_deadlock_free_and_persists(ledger_paths):
+    """Drive the real _update_unit without mocking — must return and persist.
+
+    This is a hermetic test that exercises the actual load-modify-save cycle
+    under the store lock, proving it doesn't deadlock and updates persist.
+    """
+    from orchestrator import store
+
+    # Setup: start with one spec unit.
+    store.update_issue_meta(7, spec_units=[
+        {"slug": "alpha", "branch": "b/alpha", "spec": {}, "stage": "implement",
+         "pr_number": None, "review_round": 0, "last_feedback": None, "implementer": None}
+    ])
+
+    # Call the real _update_unit (not mocked) — this acquires the store lock,
+    # loads data, updates the unit matching the slug, and saves.
+    stages._update_unit(7, "alpha", stage="review", pr_number=101)
+
+    # Verify the update persisted and didn't deadlock.
+    m = store.issue_meta(7)
+    units = m.get("spec_units", [])
+    assert len(units) == 1
+    assert units[0]["slug"] == "alpha"
+    assert units[0]["stage"] == "review"
+    assert units[0]["pr_number"] == 101
