@@ -119,36 +119,38 @@ def test_ledger_persists_across_instances(clock, ledger_paths):
 
 
 def test_issue_meta_round_trips(ledger_paths):
-    assert store.issue_meta(42) == {}
-    store.update_issue_meta(42, branch="pipeline/issue-42", review_round=0)
-    m = store.issue_meta(42)
+    key = "owner/repo#42"
+    assert store.issue_meta(key) == {}
+    store.update_issue_meta(key, branch="pipeline/issue-42", review_round=0)
+    m = store.issue_meta(key)
     assert m["branch"] == "pipeline/issue-42"
     assert m["review_round"] == 0
 
 
 def test_update_issue_meta_merges_fields(ledger_paths):
-    store.update_issue_meta(7, branch="b", review_round=0)
-    store.update_issue_meta(7, review_round=2, pr_number=99)
-    m = store.issue_meta(7)
+    key = "owner/repo#7"
+    store.update_issue_meta(key, branch="b", review_round=0)
+    store.update_issue_meta(key, review_round=2, pr_number=99)
+    m = store.issue_meta(key)
     assert m == {"branch": "b", "review_round": 2, "pr_number": 99}
 
 
 def test_issue_meta_is_keyed_per_issue(ledger_paths):
-    store.update_issue_meta(1, branch="one")
-    store.update_issue_meta(2, branch="two")
-    assert store.issue_meta(1)["branch"] == "one"
-    assert store.issue_meta(2)["branch"] == "two"
+    store.update_issue_meta("owner/repo#1", branch="one")
+    store.update_issue_meta("owner/repo#2", branch="two")
+    assert store.issue_meta("owner/repo#1")["branch"] == "one"
+    assert store.issue_meta("owner/repo#2")["branch"] == "two"
 
 
 # ── Concurrency tests ────────────────────────────────────────────────────────
 def test_concurrent_issue_meta_updates_dont_clobber(ledger_paths):
     """Many threads updating distinct fields on the same issue — all writes persist."""
-    n = 42
+    key = "owner/repo#42"
     barriers = [threading.Barrier(3), threading.Barrier(3)]
 
     def worker(field, value):
         barriers[0].wait()                     # all threads arrive together
-        store.update_issue_meta(n, **{field: value})
+        store.update_issue_meta(key, **{field: value})
         barriers[1].wait()                     # wait for all to finish
 
     threads = [
@@ -161,7 +163,7 @@ def test_concurrent_issue_meta_updates_dont_clobber(ledger_paths):
     for t in threads:
         t.join()
 
-    m = store.issue_meta(n)
+    m = store.issue_meta(key)
     assert m == {"a": 1, "b": 2, "c": 3}       # no lost updates
 
 
@@ -262,3 +264,80 @@ def test_concurrent_reserve_reconcile_produces_correct_final_tally(ledger_paths)
     # Actuals: 180 + 150 + 320 + 90 = 740
     assert fresh_ledger.d["claude"]["w5"]["tokens"] == 740
     assert fresh_ledger.d["claude"]["wk"]["tokens"] == 740
+
+
+# ── Legacy key migration (multi-repo namespacing) ────────────────────────────────
+def test_migrate_legacy_keys_converts_bare_integers(ledger_paths):
+    """Bare integer keys become 'owner/repo#n' under the target slug."""
+    # Seed with realistic in-flight meta like a pre-upgrade deployment would have.
+    meta = {
+        "spec_units": [{"slug": "s1", "stage": "implement", "pr_number": None}],
+        "review_round": 0,
+        "human_guidance": None,
+    }
+    store.update_issue_meta("5", **meta)
+
+    migrated, skipped = store.migrate_legacy_keys("owner/repo")
+    assert len(migrated) == 1
+    assert migrated[0] == ("5", "owner/repo#5")
+    assert store.issue_meta("owner/repo#5") == meta
+    # Old key gone.
+    assert store.issue_meta("5") == {}
+
+
+def test_migrate_legacy_keys_is_idempotent(ledger_paths):
+    """A second migration run makes no changes."""
+    store.update_issue_meta("3", branch="pipeline/issue-3")
+    store.migrate_legacy_keys("owner/repo")
+
+    # Second run: everything already namespaced → no changes.
+    migrated2, skipped2 = store.migrate_legacy_keys("owner/repo")
+    assert migrated2 == []
+    # Namespaced key still intact.
+    assert store.issue_meta("owner/repo#3")["branch"] == "pipeline/issue-3"
+
+
+def test_migrate_legacy_keys_leaves_namespaced_keys_untouched(ledger_paths):
+    """Keys already containing '#' are never modified."""
+    store.update_issue_meta("owner/repo#10", branch="b/10")
+    store.update_issue_meta("other/repo#10", branch="b/other")
+
+    migrated, _ = store.migrate_legacy_keys("owner/repo")
+    assert migrated == []   # nothing to migrate — already namespaced
+    assert store.issue_meta("owner/repo#10")["branch"] == "b/10"
+    assert store.issue_meta("other/repo#10")["branch"] == "b/other"
+
+
+def test_migrate_legacy_keys_without_slug_warns_and_leaves_bare_keys(ledger_paths, caplog):
+    """When repo_slug is None, bare keys are left and a warning is logged."""
+    import logging
+    store.update_issue_meta("7", branch="b")
+
+    with caplog.at_level(logging.WARNING, logger="root"):
+        migrated, _ = store.migrate_legacy_keys(None)
+
+    assert migrated == []
+    assert store.issue_meta("7") == {"branch": "b"}   # untouched
+    assert any("7" in rec.message for rec in caplog.records)
+
+
+def test_migrate_two_bare_keys_both_converted(ledger_paths):
+    """Multiple bare integer keys are all migrated in one pass."""
+    store.update_issue_meta("1", spec_units=[])
+    store.update_issue_meta("2", review_round=1)
+
+    migrated, _ = store.migrate_legacy_keys("org/r")
+    assert len(migrated) == 2
+    keys_after = {m[1] for m in migrated}
+    assert "org/r#1" in keys_after
+    assert "org/r#2" in keys_after
+    assert store.issue_meta("org/r#1") == {"spec_units": []}
+    assert store.issue_meta("org/r#2") == {"review_round": 1}
+
+
+def test_namespaced_keys_with_same_number_dont_clobber_each_other(ledger_paths):
+    """Two repos with issue #5 keep entirely separate store entries."""
+    store.update_issue_meta("org/repo-a#5", branch="b/a")
+    store.update_issue_meta("org/repo-b#5", branch="b/b")
+    assert store.issue_meta("org/repo-a#5")["branch"] == "b/a"
+    assert store.issue_meta("org/repo-b#5")["branch"] == "b/b"

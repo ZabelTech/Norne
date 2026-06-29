@@ -1,5 +1,6 @@
 """Config parsing + routing-table invariants."""
 import importlib
+import pytest
 
 from orchestrator import config
 
@@ -143,6 +144,33 @@ def test_family_available_tracks_credential_presence(monkeypatch):
 
 def test_family_available_unknown_family_is_false():
     assert config.family_available("gpt") is False
+
+
+# ── Multi-repo configuration validation ────────────────────────────────────────
+
+def test_validate_config_raises_when_neither_owner_nor_repo_set(monkeypatch):
+    monkeypatch.setattr(config, "GH_OWNER", None)
+    monkeypatch.setattr(config, "GH_REPO", None)
+    with pytest.raises(RuntimeError, match="GH_OWNER"):
+        config.validate_config()
+
+
+def test_validate_config_passes_with_gh_owner_only(monkeypatch):
+    monkeypatch.setattr(config, "GH_OWNER", "ZabelTech")
+    monkeypatch.setattr(config, "GH_REPO", None)
+    config.validate_config()   # must not raise
+
+
+def test_validate_config_passes_with_gh_repo_only(monkeypatch):
+    monkeypatch.setattr(config, "GH_OWNER", None)
+    monkeypatch.setattr(config, "GH_REPO", "owner/repo")
+    config.validate_config()   # must not raise
+
+
+def test_validate_config_passes_with_both_set(monkeypatch):
+    monkeypatch.setattr(config, "GH_OWNER", "ZabelTech")
+    monkeypatch.setattr(config, "GH_REPO", "owner/repo")
+    config.validate_config()   # must not raise
 
 
 def test_glm_tier_limits_have_all_tiers():

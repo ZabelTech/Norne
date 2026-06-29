@@ -8,23 +8,23 @@ import subprocess
 import threading
 from . import config
 
-REMOTE = f"https://x-access-token:{config.GH_TOKEN}@github.com/{config.GH_REPO}.git"
-
 # ── Per-issue git lock registry ───────────────────────────────────────────────
 _repo_locks = {}
 _repo_locks_lock = threading.Lock()
 
 
-def _repo_lock_for(n):
+def _repo_lock_for(gh, n):
     """Get or create a lock for this specific issue's repo operations.
 
     Uses RLock (reentrant) so a function holding the lock can call another
     function that needs the same lock (e.g., ensure_worktree -> remove_worktree).
+    The lock is namespaced by repo via gh.slug_n to prevent collisions.
     """
+    lock_key = gh.slug_n(n)
     with _repo_locks_lock:
-        if n not in _repo_locks:
-            _repo_locks[n] = threading.RLock()
-        return _repo_locks[n]
+        if lock_key not in _repo_locks:
+            _repo_locks[lock_key] = threading.RLock()
+        return _repo_locks[lock_key]
 
 
 def _git(args, cwd, check=False, capture_output=True):
@@ -33,11 +33,15 @@ def _git(args, cwd, check=False, capture_output=True):
                          capture_output=capture_output, text=True)
 
 
-def workdir(n):
-    return os.path.join(config.WORKDIR_ROOT, f"issue-{n}")
+def workdir(gh, n):
+    """Path for the primary checkout of issue n in this repo.
+
+    Namespaced by repo to prevent collisions: e.g. 'work/ZabelTech-foo-5/'.
+    """
+    return os.path.join(config.WORKDIR_ROOT, gh.slug_n(n))
 
 
-def workdir_spec(n, slug):
+def workdir_spec(gh, n, slug):
     """Path for a spec-branch worktree — a sibling container, not nested.
 
     The approved summary wrote `/data/work/issue-N/<slug>`, but that would nest
@@ -45,16 +49,17 @@ def workdir_spec(n, slug):
     and `git status` (used by commit_all/dirty_files) treat the worktree as
     untracked junk. Using `worktrees/issue-N/<slug>` keeps each spec tree cleanly
     isolated outside the primary while preserving the approved intent.
+    Namespaced by repo: e.g. 'worktrees/ZabelTech-foo-5/spec-1/'.
     """
-    return os.path.join(config.WORKDIR_ROOT, "worktrees", f"issue-{n}", slug)
+    return os.path.join(config.WORKDIR_ROOT, "worktrees", gh.slug_n(n), slug)
 
 
-def ensure_repo(n):
+def ensure_repo(gh, n):
     """Clone if missing; return the checkout path."""
-    path = workdir(n)
+    path = workdir(gh, n)
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(config.WORKDIR_ROOT, exist_ok=True)
-        subprocess.run(["git", "clone", REMOTE, path], capture_output=True, text=True)
+        subprocess.run(["git", "clone", gh.remote, path], capture_output=True, text=True)
         _git(["config", "user.name", "pipeline-bot"], path)
         _git(["config", "user.email", "pipeline-bot@users.noreply.github.com"], path)
     return path
@@ -110,7 +115,7 @@ def push(path, branch):
     return _git(["push", "-u", "origin", branch], path)
 
 
-def ensure_worktree(n, slug, branch, base):
+def ensure_worktree(gh, n, slug, branch, base):
     """Ensure a clean worktree for this spec branch exists and return its path.
 
     Under the per-issue git lock: ensure the primary clone exists, fetch, detach
@@ -118,9 +123,9 @@ def ensure_worktree(n, slug, branch, base):
     load-bearing fix that prevents 'branch already checked out' errors), prune
     stale worktrees, then add or reset the worktree. Idempotent across crashes.
     """
-    lock = _repo_lock_for(n)
+    lock = _repo_lock_for(gh, n)
     with lock:
-        primary = ensure_repo(n)                      # primary checkout hosts worktrees
+        primary = ensure_repo(gh, n)                      # primary checkout hosts worktrees
         _git(["fetch", "origin"], primary)
 
         # Move the primary OFF the spec branch — otherwise `git worktree add`
@@ -130,9 +135,9 @@ def ensure_worktree(n, slug, branch, base):
         # Clean up any stale worktree registration.
         _git(["worktree", "prune"], primary)
 
-        path = workdir_spec(n, slug)
+        path = workdir_spec(gh, n, slug)
         # If path exists, remove it first (idempotent).
-        remove_worktree(n, path)  # runs inside the same lock
+        remove_worktree(gh, n, path)  # runs inside the same lock
 
         # Create (or reset) the worktree from the branch.
         # `-B` creates or resets the local branch from origin — authoritative
@@ -141,11 +146,11 @@ def ensure_worktree(n, slug, branch, base):
         return path
 
 
-def remove_worktree(n, path):
+def remove_worktree(gh, n, path):
     """Remove a worktree, ignoring if it doesn't exist (bounded cleanup)."""
-    lock = _repo_lock_for(n)
+    lock = _repo_lock_for(gh, n)
     with lock:
-        primary = ensure_repo(n)
+        primary = ensure_repo(gh, n)
         # Prune first to clear stale registrations.
         _git(["worktree", "prune"], primary)
         # Force-remove the worktree; ignore errors if path already gone.

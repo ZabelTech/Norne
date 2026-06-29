@@ -452,6 +452,15 @@ def test_pause_records_comment_baseline(monkeypatch):
     posted = {}
 
     class GH:
+        def __init__(self, repo="owner/repo"):
+            self.repo = repo
+            if "/" not in repo:
+                raise ValueError(f"Invalid repo format: {repo}. Expected 'owner/name'.")
+            self.owner, self.name = repo.split("/", 1)
+
+        def key(self, n):
+            return f"{self.repo}#{n}"
+
         def add_labels(self, n, names):
             pass
 
@@ -476,6 +485,10 @@ def _R(data):
 class _SpecGH:
     def __init__(self):
         self.comments = []
+        self.repo = "owner/repo"
+
+    def key(self, n):
+        return f"{self.repo}#{n}"
 
     def comment(self, n, body, **k):    # capture the per-round checkpoint comment
         self.comments.append(body)
@@ -492,7 +505,7 @@ def _spec_env(monkeypatch, seq):
         return next(it)
 
     monkeypatch.setattr(stages, "_run", fake_run)
-    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda gh, n: "/p")
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
     monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
     monkeypatch.setattr(stages, "issue_meta", lambda n: dict(meta))
@@ -593,8 +606,9 @@ def test_spec_parse_failure_surfaces_the_agents_message(monkeypatch):
 class _FanGH:
     """Records the GitHub calls the per-spec handlers make, with enough behaviour
     to drive a unit through implement -> review -> merge -> close."""
-    def __init__(self, default="main", pulls=None):
+    def __init__(self, default="main", pulls=None, repo="owner/repo"):
         self.default = default
+        self.repo = repo
         self.flow = None
         self.comments = []
         self.created_pulls = []
@@ -604,6 +618,9 @@ class _FanGH:
         self._pulls = pulls or {}                 # branch -> existing PR (or none)
         self._by_number = {}
         self.comment_calls = []                    # (target_number, body)
+
+    def key(self, n):
+        return f"{self.repo}#{n}"
 
     def default_branch(self):
         return self.default
@@ -681,6 +698,42 @@ def test_units_migrates_a_legacy_single_branch_issue():
     assert u["branch"] == "pipeline/issue-9" and u["pr_number"] == 42
     assert u["stage"] == "review"                       # has a PR -> mid-review
     assert u["implementer"] == "glm" and u["review_round"] == 1
+
+
+def test_migrated_meta_yields_non_empty_units_not_zero_units_close(monkeypatch):
+    """Regression: after migrate_legacy_keys renames bare-n to owner/repo#n,
+    _units() on the migrated meta must return the real spec units so _advance
+    does NOT fall into the zero-units 'all merged -> close' branch."""
+    from orchestrator import store
+
+    # Simulate what migrate_legacy_keys does: a bare key '5' gets renamed to
+    # 'owner/repo#5' with spec_units that have an open PR (stage='review').
+    # _advance must NOT close the issue.
+    migrated_meta = {
+        "spec_units": [{"slug": "s1", "title": "Spec 1", "branch": "pipeline/issue-5/s1",
+                         "spec": {}, "stage": "review", "pr_number": 99,
+                         "review_round": 0, "last_feedback": None, "implementer": "glm"}]
+    }
+    units = stages._units(migrated_meta, "review")
+    assert len(units) == 1
+    assert units[0]["stage"] == "review"
+    assert units[0]["pr_number"] == 99
+
+    # _advance with a review-stage unit must set flow:review, NOT call close_issue.
+    closed = []
+    flow_set = []
+
+    class GH:
+        def set_flow(self, n, label, issue=None):
+            flow_set.append(label)
+        def comment(self, n, body, **k):
+            pass
+        def close_issue(self, n):
+            closed.append(n)
+
+    stages._advance(GH(), 5, units)
+    assert flow_set == [stages.config.FLOW_REVIEW]
+    assert closed == []   # issue must NOT be closed
 
 
 def test_implement_opens_pr_linking_issue_without_closing(monkeypatch):
@@ -817,6 +870,10 @@ class _SumGH:
         self.flow = None
         self.labels = []
         self.comments = []
+        self.repo = "owner/repo"
+
+    def key(self, n):
+        return f"{self.repo}#{n}"
 
     def list_comments(self, n):
         return []
@@ -833,7 +890,7 @@ class _SumGH:
 
 def _sum_env(monkeypatch, res):
     monkeypatch.setattr(stages, "_run", lambda *a, **k: ("claude", res))
-    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda gh, n: "/p")
     monkeypatch.setattr(stages.instructions, "load", lambda step, path: "")
     monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: None)
 
@@ -881,18 +938,20 @@ def test_update_unit_deadlock_free_and_persists(ledger_paths):
     """
     from orchestrator import store
 
+    key = "owner/repo#7"
+
     # Setup: start with one spec unit.
-    store.update_issue_meta(7, spec_units=[
+    store.update_issue_meta(key, spec_units=[
         {"slug": "alpha", "branch": "b/alpha", "spec": {}, "stage": "implement",
          "pr_number": None, "review_round": 0, "last_feedback": None, "implementer": None}
     ])
 
     # Call the real _update_unit (not mocked) — this acquires the store lock,
     # loads data, updates the unit matching the slug, and saves.
-    stages._update_unit(7, "alpha", stage="review", pr_number=101)
+    stages._update_unit(key, "alpha", stage="review", pr_number=101)
 
     # Verify the update persisted and didn't deadlock.
-    m = store.issue_meta(7)
+    m = store.issue_meta(key)
     units = m.get("spec_units", [])
     assert len(units) == 1
     assert units[0]["slug"] == "alpha"
@@ -935,8 +994,8 @@ def test_implement_fan_out_all_units_processed(monkeypatch):
     monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     # Distinct paths per slug so mock_run can identify which unit is running.
     monkeypatch.setattr(stages.repo, "ensure_worktree",
-                        lambda n, slug, branch, base: f"/p/{slug}")
-    monkeypatch.setattr(stages.repo, "remove_worktree", lambda n, path: None)
+                        lambda gh, n, slug, branch, base: f"/p/{slug}")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda gh, n, path: None)
     monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
     monkeypatch.setattr(stages.repo, "push", lambda *a: None)
     monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
@@ -1130,7 +1189,7 @@ def test_spec_author_session_persisted_and_resumed_on_next_round(monkeypatch):
                                    data={"status": "ready", "specs": []}))
 
     monkeypatch.setattr(stages, "_run", fake_run_with_checkpoint)
-    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda gh, n: "/p")
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
     monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
     monkeypatch.setattr(stages, "issue_meta", lambda n: dict(meta))
@@ -1169,7 +1228,11 @@ def test_reset_spec_loop_clears_sessions(monkeypatch):
 
     monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: meta.update(kw))
 
-    stages._reset_spec_loop(1)
+    class _GH:
+        def key(self, n):
+            return f"owner/repo#{n}"
+
+    stages._reset_spec_loop(_GH(), 1)
 
     assert meta.get("spec_author_session") is None
     assert meta.get("spec_reviewer_session") is None
@@ -1217,6 +1280,11 @@ def test_implement_session_persisted_and_resumed_on_fix_round(monkeypatch):
     monkeypatch.setattr(stages, "_run", fake_run)
 
     class _ImplGH:
+        repo = "owner/repo"
+
+        def key(self, n):
+            return f"{self.repo}#{n}"
+
         def default_branch(self):
             return "main"
         def pull_for_branch(self, branch):
