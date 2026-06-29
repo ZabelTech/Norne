@@ -3,7 +3,12 @@
 These exercise the heart of the soft budget gate: how usage is tallied across
 the rolling 5h/weekly windows, when a pool runs out of headroom, when windows
 roll over, and the blocked:budget retry hint.
+
+Includes concurrency tests: store operations and ledger accounting are
+correct under concurrent access.
 """
+import threading
+import time
 from orchestrator import config, store
 
 _FIVE_H = 5 * 3600
@@ -113,3 +118,127 @@ def test_issue_meta_is_keyed_per_issue(ledger_paths):
     store.update_issue_meta(2, branch="two")
     assert store.issue_meta(1)["branch"] == "one"
     assert store.issue_meta(2)["branch"] == "two"
+
+
+# ── Concurrency tests ────────────────────────────────────────────────────────
+def test_concurrent_issue_meta_updates_dont_clobber(ledger_paths):
+    """Many threads updating distinct fields on the same issue — all writes persist."""
+    n = 42
+    barriers = [threading.Barrier(3), threading.Barrier(3)]
+
+    def worker(field, value):
+        barriers[0].wait()                     # all threads arrive together
+        store.update_issue_meta(n, **{field: value})
+        barriers[1].wait()                     # wait for all to finish
+
+    threads = [
+        threading.Thread(target=worker, args=("a", 1)),
+        threading.Thread(target=worker, args=("b", 2)),
+        threading.Thread(target=worker, args=("c", 3)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    m = store.issue_meta(n)
+    assert m == {"a": 1, "b": 2, "c": 3}       # no lost updates
+
+
+def test_concurrent_ledger_record_produces_exact_tallies(ledger_paths, clock):
+    """Many threads calling record() — final totals are exact."""
+    fresh_ledger = store.Ledger()
+    barriers = [threading.Barrier(5), threading.Barrier(5)]
+
+    def worker(pool, tokens, prompts):
+        barriers[0].wait()
+        fresh_ledger.record(pool, tokens=tokens, prompts=prompts)
+        barriers[1].wait()
+
+    threads = [
+        threading.Thread(target=worker, args=("claude", 100, 0)),
+        threading.Thread(target=worker, args=("claude", 50, 0)),
+        threading.Thread(target=worker, args=("glm", 0, 3)),
+        threading.Thread(target=worker, args=("glm", 0, 2)),
+        threading.Thread(target=worker, args=("claude", 10, 0)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 160
+    assert fresh_ledger.d["glm"]["w5"]["prompts"] == 5
+
+
+def test_reserve_returns_false_when_pool_lacks_headroom(ledger_paths, clock):
+    """Reserve when a pool is at ceiling returns False and charges nothing."""
+    fresh_ledger = store.Ledger()
+    # Exhaust the claude pool.
+    fresh_ledger.record("claude", tokens=850)  # at ceiling (1000 * 0.85)
+
+    assert fresh_ledger.headroom("claude") is False
+    assert fresh_ledger.reserve("claude", tokens=100) is False
+    # Still at 850 — nothing charged.
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 850
+
+
+def test_reserve_returns_true_and_precharges_when_pool_has_headroom(ledger_paths):
+    """Reserve when a pool has room returns True and charges the estimate."""
+    fresh_ledger = store.Ledger()
+
+    assert fresh_ledger.headroom("claude") is True
+    assert fresh_ledger.reserve("claude", tokens=100) is True
+    # Estimate charged to both windows.
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 100
+    assert fresh_ledger.d["claude"]["wk"]["tokens"] == 100
+
+
+def test_reconcile_corrects_overestimate(ledger_paths):
+    """Reconcile with actual < reserved refunds the difference."""
+    fresh_ledger = store.Ledger()
+    fresh_ledger.reserve("claude", tokens=200)
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 200
+
+    # Actual usage was only 150.
+    fresh_ledger.reconcile("claude", reserved_tokens=200, actual_tokens=150)
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 150
+    assert fresh_ledger.d["claude"]["wk"]["tokens"] == 150
+
+
+def test_reconcile_corrects_underestimate(ledger_paths):
+    """Reconcile with actual > reserved tops up the difference."""
+    fresh_ledger = store.Ledger()
+    fresh_ledger.reserve("claude", tokens=100)
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 100
+
+    # Actual usage was 120.
+    fresh_ledger.reconcile("claude", reserved_tokens=100, actual_tokens=120)
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 120
+    assert fresh_ledger.d["claude"]["wk"]["tokens"] == 120
+
+
+def test_concurrent_reserve_reconcile_produces_correct_final_tally(ledger_paths):
+    """Threads reserve/reconcile in parallel — final accounting is exact."""
+    fresh_ledger = store.Ledger()
+    barrier = threading.Barrier(4)
+
+    def worker(reserved, actual):
+        barrier.wait()
+        if fresh_ledger.reserve("claude", tokens=reserved):
+            fresh_ledger.reconcile("claude", reserved_tokens=reserved, actual_tokens=actual)
+
+    threads = [
+        threading.Thread(target=worker, args=(200, 180)),
+        threading.Thread(target=worker, args=(150, 150)),
+        threading.Thread(target=worker, args=(300, 320)),
+        threading.Thread(target=worker, args=(100, 90)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Actuals: 180 + 150 + 320 + 90 = 740
+    assert fresh_ledger.d["claude"]["w5"]["tokens"] == 740
+    assert fresh_ledger.d["claude"]["wk"]["tokens"] == 740

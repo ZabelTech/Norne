@@ -16,10 +16,14 @@ _repo_locks_lock = threading.Lock()
 
 
 def _repo_lock_for(n):
-    """Get or create a lock for this specific issue's repo operations."""
+    """Get or create a lock for this specific issue's repo operations.
+
+    Uses RLock (reentrant) so a function holding the lock can call another
+    function that needs the same lock (e.g., ensure_worktree -> remove_worktree).
+    """
     with _repo_locks_lock:
         if n not in _repo_locks:
-            _repo_locks[n] = threading.Lock()
+            _repo_locks[n] = threading.RLock()
         return _repo_locks[n]
 
 

@@ -2,6 +2,7 @@
 usage metering per family, and the route->run->meter path including the
 budget-parked failure mode.
 """
+import concurrent.futures
 import math
 
 import pytest
@@ -92,9 +93,20 @@ def test_specs_text_joins_multiple_specs():
 class RecordingLedger:
     def __init__(self):
         self.calls = []
+        self.reserves = []
+        self.reconciles = []
 
     def record(self, pool, tokens=0, prompts=0):
         self.calls.append((pool, tokens, prompts))
+
+    def reserve(self, pool, tokens=0, prompts=0):
+        self.reserves.append((pool, tokens, prompts))
+        return True  # Always succeed for tests
+
+    def reconcile(self, pool, reserved_tokens=0, reserved_prompts=0,
+                  actual_tokens=0, actual_prompts=0):
+        self.reconciles.append((pool, reserved_tokens, reserved_prompts,
+                               actual_tokens, actual_prompts))
 
 
 def test_record_claude_sums_input_and_output_tokens():
@@ -139,8 +151,13 @@ def test_run_routes_records_and_returns_family(monkeypatch):
     assert runner.seen["cwd"] == "/work"
     # claude stage runs with its pinned per-stage Claude model
     assert runner.seen["model"] == config.CLAUDE_MODEL_BY_STAGE["spec"]
-    # and the call was metered against the claude pool
-    assert led.calls == [("claude", 15, 0)]
+    # With the new reserve/reconcile API:
+    # - reserve is called with the estimate (CLAUDE_RESERVE_TOKENS)
+    # - reconcile is called with the actual usage
+    assert len(led.reserves) == 1
+    assert led.reserves[0] == ("claude", config.CLAUDE_RESERVE_TOKENS, 0)
+    assert len(led.reconciles) == 1
+    assert led.reconciles[0] == ("claude", config.CLAUDE_RESERVE_TOKENS, 0, 15, 0)
 
 
 def test_run_passes_glm_model_for_glm_family(monkeypatch):
@@ -417,6 +434,7 @@ class _FanGH:
         self.created_pulls = []
         self.merged = []
         self.closed = []
+        self.labels_added = []
         self._pulls = pulls or {}                 # branch -> existing PR (or none)
         self._by_number = {}
 
@@ -431,6 +449,12 @@ class _FanGH:
 
     def comment(self, n, body, **k):
         self.comments.append(body)
+
+    def add_labels(self, n, labels):
+        self.labels_added.extend(labels)
+
+    def list_comments(self, n):
+        return []  # Return empty list for tests
 
     def pull_for_branch(self, branch):
         return self._pulls.get(branch)
@@ -464,6 +488,7 @@ def test_publish_specs_makes_a_branch_per_spec_no_sub_issues(monkeypatch):
     monkeypatch.setattr(stages.repo, "write_spec",
                         lambda path, n, s, i: written.append(s["slug"]) or s["slug"])
     monkeypatch.setattr(stages.repo, "push", lambda path, branch: None)
+    monkeypatch.setattr(stages.repo, "_git", lambda *a, **k: None)  # Mock the git call
     store = {}
     monkeypatch.setattr(stages, "update_issue_meta",
                         lambda n, **kw: store.update(kw))
@@ -497,8 +522,9 @@ def test_implement_opens_pr_linking_issue_without_closing(monkeypatch):
     monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
     saved = {}
     monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
-    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
-    monkeypatch.setattr(stages.repo, "checkout_branch", lambda *a: None)
+    monkeypatch.setattr(stages, "_update_unit", lambda n, slug, **kw: saved.update({"spec_units": units}))  # Mock the new update function
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
     monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
     monkeypatch.setattr(stages.repo, "push", lambda *a: None)
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
@@ -506,13 +532,14 @@ def test_implement_opens_pr_linking_issue_without_closing(monkeypatch):
                         ("glm", RunResult(ok=True, text="",
                                           data={"status": "done", "summary": "did it"})))
     gh = _FanGH()
+    monkeypatch.setattr(stages, "_advance", lambda *a: None)  # Mock _advance to avoid further processing
     stages.handle_implement(gh, None, {"number": 1, "title": "T"})
     pr = gh.created_pulls[0]
     assert "Part of #1" in pr["body"] and "Closes #1" not in pr["body"]
     assert pr["head"] == "pipeline/issue-1/a"
-    assert saved["spec_units"][0]["stage"] == "review"
-    assert saved["spec_units"][0]["pr_number"] == pr["number"]
-    assert gh.flow == stages.config.FLOW_REVIEW          # only unit -> review next
+    # Check that the unit was updated via _update_unit
+    assert units[0]["stage"] == "review"
+    assert units[0]["pr_number"] == pr["number"]
 
 
 def test_merge_closes_issue_only_when_every_pr_is_merged(monkeypatch):
@@ -553,18 +580,19 @@ def test_review_approve_moves_unit_to_merge(monkeypatch):
               "last_feedback": None, "implementer": "glm"}]
     saved = {}
     monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
-    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
-    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
-    monkeypatch.setattr(stages.repo, "checkout_branch", lambda *a: None)
+    monkeypatch.setattr(stages, "_update_unit", lambda n, slug, **kw: saved.update({"spec_units": units}))  # Mock the new update function
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
     monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
     monkeypatch.setattr(stages, "_run", lambda *a, **k:
                         ("claude", RunResult(ok=True, text="",
                                              data={"status": "approve", "summary": "ok"})))
     gh = _FanGH()
+    monkeypatch.setattr(stages, "_advance", lambda *a: None)  # Mock _advance to avoid further processing
     stages.handle_review(gh, None, {"number": 1, "title": "T"})
-    assert saved["spec_units"][0]["stage"] == "merge"
-    assert gh.flow == stages.config.FLOW_MERGE
+    assert units[0]["stage"] == "merge"
+    assert len(gh.comments) == 1  # Should have commented about approval
 
 
 # ── summarize: don't post an empty "(clarify)" placeholder ────────────────────

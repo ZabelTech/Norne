@@ -9,6 +9,7 @@ class FakeGH:
         self._latest = latest
         self.flow_set = []
         self.removed = []
+        self._issues = []
 
     def labels_of(self, issue):
         return set(self._labels)
@@ -21,6 +22,9 @@ class FakeGH:
 
     def remove_label(self, n, name):
         self.removed.append(name)
+
+    def list_issues(self, state="open"):
+        return self._issues
 
 
 def _issue(n=1):
@@ -128,3 +132,71 @@ def test_human_needed_waiting_logs_why(monkeypatch, capsys):
     main.process_issue(gh, ledger=None, issue=_issue())
     out = capsys.readouterr().out
     assert "human:needed" in out and "waiting" in out
+
+
+# ── Concurrency tests ─────────────────────────────────────────────────────────
+import concurrent.futures
+import threading
+import time
+
+
+def test_dispatch_once_respects_inflight_guard():
+    """An issue already in flight is not submitted again."""
+    gh = FakeGH(labels={})
+    gh._issues = [
+        {"number": 1, "title": "Issue 1"},
+        {"number": 2, "title": "Issue 2"},
+    ]
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    ledger = None
+    inflight = {1, 2}
+    lock = threading.Lock()
+
+    submitted = []
+
+    def dummy_process_issue(gh, ledger, issue):
+        submitted.append(issue["number"])
+
+    original = main.process_issue
+    main.process_issue = dummy_process_issue
+    try:
+        main.dispatch_once(gh, executor, ledger, inflight, lock)
+    finally:
+        main.process_issue = original
+
+    # No submissions — both were in-flight.
+    assert len(submitted) == 0
+    assert inflight == {1, 2}
+
+
+def test_inflight_guard_releases_on_done_callback():
+    """The done callback removes the issue from inflight after completion."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    inflight = {42}
+    lock = threading.Lock()
+
+    fut = executor.submit(lambda: None)
+    fut.add_done_callback(main._done_callback(42, inflight, lock, 0))
+    fut.result()  # wait for completion
+
+    assert 42 not in inflight
+
+
+def test_inflight_guard_releases_on_error():
+    """The done callback removes from inflight even if the task raised."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    inflight = {42}
+    lock = threading.Lock()
+
+    def failing():
+        raise ValueError("boom")
+
+    fut = executor.submit(failing)
+    fut.add_done_callback(main._done_callback(42, inflight, lock, 0))
+    try:
+        fut.result()  # will raise
+    except ValueError:
+        pass
+
+    assert 42 not in inflight
