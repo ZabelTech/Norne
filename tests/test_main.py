@@ -200,3 +200,42 @@ def test_inflight_guard_releases_on_error():
         pass
 
     assert 42 not in inflight
+
+
+def test_dispatch_once_peak_concurrency_cap():
+    """The executor's max_workers cap is observed: peak concurrent process_issue
+    calls never exceeds MAX_WORKERS=2 even when 4 candidates are dispatched.
+
+    Uses a real ThreadPoolExecutor and a slow stub that records peak concurrency
+    via a shared counter — exactly what the spec test plan prescribes.
+    """
+    MAX_W = 2
+
+    # Issues need a flow label so candidates() picks them up.
+    gh = FakeGH(labels={config.FLOW_SPEC})
+    gh._issues = [{"number": i, "title": f"Issue {i}"} for i in range(1, 5)]
+
+    peak = [0]
+    active = [0]
+    counter_lock = threading.Lock()
+
+    def slow_process_issue(gh, ledger, issue):
+        with counter_lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.02)  # ensure concurrent workers overlap so peak is observable
+        with counter_lock:
+            active[0] -= 1
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_W)
+    original = main.process_issue
+    main.process_issue = slow_process_issue
+    try:
+        inflight = set()
+        inflight_lock = threading.Lock()
+        main.dispatch_once(gh, executor, None, inflight, inflight_lock)
+        executor.shutdown(wait=True)
+    finally:
+        main.process_issue = original
+
+    assert peak[0] <= MAX_W

@@ -4,11 +4,13 @@ budget-parked failure mode.
 """
 import concurrent.futures
 import math
+import threading
+import time
 
 import pytest
 
 from orchestrator import config, stages
-from orchestrator.runners import RunResult
+from orchestrator.runners import RunResult, RateLimited
 
 
 # ── _specs_text ─────────────────────────────────────────────────────────────
@@ -188,6 +190,40 @@ def test_run_raises_budget_parked_when_no_family(monkeypatch):
     with pytest.raises(stages.BudgetParked):
         stages._run("review", led, "P", cwd="/w")
     assert led.calls == []  # nothing metered when parked
+
+
+def test_run_raises_budget_parked_when_reserve_returns_false(monkeypatch):
+    """BudgetParked/failover: reserve() returning False raises BudgetParked.
+
+    This tests the path where the pool exhausts between router choice and
+    reservation — exactly where the blocking bug hides.
+    """
+    led = RecordingLedger()
+
+    # Reserve returns False (pool exhausted during reservation)
+    original_reserve = led.reserve
+
+    def reserve_returns_false(pool, tokens=0, prompts=0):
+        # Still record the call for test verification
+        led.reserves.append((pool, tokens, prompts))
+        return False
+
+    led.reserve = reserve_returns_false
+
+    # Router chooses a family, but reserve fails
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    monkeypatch.setattr(stages.runners, "get_runner",
+                        lambda fam: StubRunner("claude", RunResult(ok=True, text="")))
+
+    with pytest.raises(stages.BudgetParked):
+        stages._run("review", led, "P", cwd="/w")
+
+    # Reserve was called but returned False, so BudgetParked was raised
+    assert led.reserves == [("claude", config.CLAUDE_RESERVE_TOKENS, 0)]
+    # Nothing was recorded because the run never happened
+    assert led.calls == []
+    # No reconcile because reserve failed
+    assert led.reconciles == []
 
 
 def test_run_forwards_exclude_family(monkeypatch):
@@ -694,3 +730,193 @@ def test_update_unit_deadlock_free_and_persists(ledger_paths):
     assert units[0]["slug"] == "alpha"
     assert units[0]["stage"] == "review"
     assert units[0]["pr_number"] == 101
+
+
+# ── Fan-out tests with 2+ units ────────────────────────────────────────────────────
+def test_implement_fan_out_all_units_processed(monkeypatch):
+    """Fan-out with 3 units, MAX_SPEC_WORKERS=2: beta fails deterministically by
+    worktree path; alpha and gamma succeed. Asserts: all 3 units attempted, peak
+    concurrent workers <= MAX_SPEC_WORKERS=2, successful siblings persisted,
+    _advance NOT called when one unit escalates, _pause called exactly once."""
+    units = [
+        {"slug": "alpha", "title": "A", "branch": "b/alpha", "spec": _two_specs()[0],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+        {"slug": "beta", "title": "B", "branch": "b/beta", "spec": _two_specs()[1],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+        {"slug": "gamma", "title": "C", "branch": "b/gamma", "spec": {"title": "C"},
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+    ]
+
+    monkeypatch.setattr(stages.config, "MAX_SPEC_WORKERS", 2)
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: None)
+    saved = {}
+
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+        saved[slug] = kw
+
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
+    # Distinct paths per slug so mock_run can identify which unit is running.
+    monkeypatch.setattr(stages.repo, "ensure_worktree",
+                        lambda n, slug, branch, base: f"/p/{slug}")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda n, path: None)
+    monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "push", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+
+    advance_calls = []
+    monkeypatch.setattr(stages, "_advance", lambda *a: advance_calls.append(a))
+
+    # Track peak concurrency to verify MAX_SPEC_WORKERS is respected.
+    peak = [0]
+    active = [0]
+    peak_lock = threading.Lock()
+
+    def mock_run(stage, ledger, prompt, cwd, **k):
+        with peak_lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.01)  # let concurrent workers overlap so peak is observable
+        with peak_lock:
+            active[0] -= 1
+        if cwd == "/p/beta":  # beta fails deterministically
+            return ("glm", RunResult(ok=True, text="",
+                                     data={"status": "needs_human", "reason": "needs input"}))
+        return ("glm", RunResult(ok=True, text="",
+                                  data={"status": "done", "summary": "did it"}))
+
+    monkeypatch.setattr(stages, "_run", mock_run)
+
+    gh = _FanGH()
+    stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+
+    # alpha and gamma succeeded; beta escalated (never reaches _update_unit)
+    assert saved.get("alpha", {}).get("stage") == "review"
+    assert saved.get("gamma", {}).get("stage") == "review"
+    assert "beta" not in saved
+
+    # MAX_SPEC_WORKERS=2 was respected
+    assert peak[0] <= 2
+
+    # _advance not called because one unit escalated; _pause called once
+    assert len(advance_calls) == 0
+    assert stages.config.FLAG_NEEDS_HUMAN in gh.labels_added
+    assert any("beta" in c for c in gh.comments)
+
+
+def test_implement_fan_out_re_raises_budget_parked(monkeypatch):
+    """Fan-out: BudgetParked is re-raised after persisting successful siblings."""
+    units = [
+        {"slug": "alpha", "title": "A", "branch": "b/alpha", "spec": _two_specs()[0],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+        {"slug": "beta", "title": "B", "branch": "b/beta", "spec": _two_specs()[1],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+    ]
+
+    monkeypatch.setattr(stages.config, "MAX_SPEC_WORKERS", 2)
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    saved = {}
+
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+        saved[slug] = kw
+
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "push", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+
+    call_count = {"count": 0}
+    count_lock = threading.Lock()
+
+    def mock_run(*a, **k):
+        with count_lock:
+            call_count["count"] += 1
+            count = call_count["count"]
+        if count == 2:  # second call hits budget limit (whichever unit that is)
+            raise stages.BudgetParked()
+        return ("glm", RunResult(ok=True, text="",
+                                  data={"status": "done", "summary": "did it"}))
+
+    monkeypatch.setattr(stages, "_run", mock_run)
+
+    gh = _FanGH()
+
+    # Should re-raise BudgetParked
+    with pytest.raises(stages.BudgetParked):
+        stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+
+    # At least one successful unit persisted its state before re-raising
+    assert len(saved) >= 1
+    assert any(s.get("stage") == "review" for s in saved.values())
+
+
+def test_implement_fan_out_re_raises_rate_limited(monkeypatch):
+    """Fan-out: RateLimited is re-raised after persisting successful siblings."""
+    units = [
+        {"slug": "alpha", "title": "A", "branch": "b/alpha", "spec": _two_specs()[0],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+        {"slug": "beta", "title": "B", "branch": "b/beta", "spec": _two_specs()[1],
+         "stage": "implement", "pr_number": None, "review_round": 0,
+         "last_feedback": None, "implementer": None},
+    ]
+
+    monkeypatch.setattr(stages.config, "MAX_SPEC_WORKERS", 2)
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    saved = {}
+
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+        saved[slug] = kw
+
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "push", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+
+    call_count = {"count": 0}
+    lock = threading.Lock()
+
+    def mock_run(*a, **k):
+        with lock:
+            call_count["count"] += 1
+            count = call_count["count"]
+        if count == 2:  # beta hits rate limit
+            raise RateLimited("glm")
+        return ("glm", RunResult(ok=True, text="",
+                                  data={"status": "done", "summary": "did it"}))
+
+    monkeypatch.setattr(stages, "_run", mock_run)
+
+    gh = _FanGH()
+
+    # Should re-raise RateLimited
+    with pytest.raises(RateLimited):
+        stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+
+    # At least one successful unit persisted its state before re-raising
+    assert len(saved) >= 1
+    assert any(s.get("stage") == "review" for s in saved.values())

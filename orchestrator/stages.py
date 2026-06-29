@@ -512,12 +512,18 @@ def handle_implement(gh, ledger, issue):
 
     # Fan-out: process all implement units concurrently.
     results = []
+    budget_or_rate_limited = False
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=config.MAX_SPEC_WORKERS) as executor:
         futures = {executor.submit(_implement_one, u): u for u in implement_units}
         for fut in concurrent.futures.as_completed(futures):
             try:
                 results.append(fut.result())
+            except (BudgetParked, RateLimited) as e:
+                u = futures[fut]
+                log(f"[#{n}] implement {u['slug']}: {type(e).__name__} -> will park")
+                results.append({"slug": u["slug"], "status": "parked", "exception": e})
+                budget_or_rate_limited = True
             except Exception as e:
                 u = futures[fut]
                 log(f"[#{n}] implement {u['slug']}: raised {e}")
@@ -531,10 +537,20 @@ def handle_implement(gh, ledger, issue):
             _update_unit(n, slug, pr_number=r["pr_number"],
                          implementer=r["implementer"], stage="review")
             log(f"[#{n}] implement {slug}: done by {r['implementer']} -> PR #{r['pr_number']}")
+        elif r["status"] == "parked":
+            # Budget/rate-limit units are already logged; don't escalate yet
+            pass
         elif r["status"] in ("escalate", "error"):
             escalation_reasons.append(
                 f"`{r['slug']}`: {r.get('reason', 'unknown failure')}")
             log(f"[#{n}] implement {r['slug']}: {r['status']} -> escalate (human:needed)")
+
+    # If any unit hit budget/rate-limit, re-raise so process_issue parks the issue.
+    if budget_or_rate_limited:
+        # Find the first budget/rate-limit exception and re-raise it
+        for r in results:
+            if r["status"] == "parked":
+                raise r["exception"]
 
     if escalation_reasons:
         combined = "\n\n".join(escalation_reasons)
@@ -599,12 +615,18 @@ def handle_review(gh, ledger, issue):
 
     # Fan-out: process all review units concurrently.
     results = []
+    budget_or_rate_limited = False
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=config.MAX_SPEC_WORKERS) as executor:
         futures = {executor.submit(_review_one, u): u for u in review_units}
         for fut in concurrent.futures.as_completed(futures):
             try:
                 results.append(fut.result())
+            except (BudgetParked, RateLimited) as e:
+                u = futures[fut]
+                log(f"[#{n}] review {u['slug']}: {type(e).__name__} -> will park")
+                results.append({"slug": u["slug"], "status": "parked", "exception": e})
+                budget_or_rate_limited = True
             except Exception as e:
                 u = futures[fut]
                 log(f"[#{n}] review {u['slug']}: raised {e}")
@@ -617,7 +639,7 @@ def handle_review(gh, ledger, issue):
         slug = r["slug"]
         if r["status"] == "approve":
             gh.comment(n, f"✅ **Review passed** for `{slug}` (PR "
-                       f"{next(u['pr_number'] for u in units if u['slug']==slug)}, "
+                       f"#{next(u['pr_number'] for u in units if u['slug']==slug)}, "
                        f"by {r['family']}).\n\n{r['summary']}",
                        model=r["model"], effort=r["effort"], tokens=r["tokens"])
             _update_unit(n, slug, stage="merge")
@@ -632,6 +654,16 @@ def handle_review(gh, ledger, issue):
         elif r["status"] == "escalate":
             escalation_reasons.append(f"`{slug}`: {r.get('reason', 'unknown failure')}")
             log(f"[#{n}] review {slug}: escalate (human:needed)")
+        elif r["status"] == "parked":
+            # Budget/rate-limit units are already logged; don't escalate yet
+            pass
+
+    # If any unit hit budget/rate-limit, re-raise so process_issue parks the issue.
+    if budget_or_rate_limited:
+        # Find the first budget/rate-limit exception and re-raise it
+        for r in results:
+            if r["status"] == "parked":
+                raise r["exception"]
 
     if escalation_reasons:
         combined = "\n\n".join(escalation_reasons)
