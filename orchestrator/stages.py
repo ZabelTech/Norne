@@ -187,20 +187,32 @@ def handle_summarize(gh, ledger, issue):
     model = _model_for("summarize", fam)
     effort = config.effort_for(model)
     d = res.data
+    summary = d.get("summary", "")
+    questions = d.get("questions") or []
+    if not summary and not questions:
+        # The triage produced nothing usable — typically a long agentic run that
+        # ended in prose without the trailing json contract. Don't post an empty
+        # "Summary (draft) … - (clarify)" placeholder with no actual questions:
+        # surface what the model really said and pause for a human.
+        log(f"[#{n}] summarize: no usable summary/questions parsed -> escalate (human:needed)")
+        _pause(gh, n, _failure_reason(
+            res, "Summarize produced no usable summary or questions — try again or "
+                 "add detail to the issue."))
+        return
     if d.get("status") == "ready":
-        gh.comment(n, f"📋 **Summary**\n\n{d.get('summary','')}\n\n"
+        gh.comment(n, f"📋 **Summary**\n\n{summary}\n\n"
                       f"If this looks right, add the `{config.SIG_APPROVE}` label to approve "
                       f"— or just comment to ask for changes.",
                    model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_APPROVAL, issue)
         log(f"[#{n}] summarize -> ready, flow:approval")
     else:
-        qs = "\n".join(f"- {q}" for q in d.get("questions", [])) or "- (clarify)"
-        gh.comment(n, f"📋 **Summary (draft)**\n\n{d.get('summary','')}\n\n"
+        qs = "\n".join(f"- {q}" for q in questions) or "- (clarify)"
+        gh.comment(n, f"📋 **Summary (draft)**\n\n{summary}\n\n"
                       f"**A few questions before I spec this:**\n{qs}",
                    model=model, effort=effort, tokens=res.input_tokens + res.output_tokens)
         gh.set_flow(n, config.FLOW_CLARIFY, issue)
-        log(f"[#{n}] summarize -> {len(d.get('questions', []))} question(s), flow:clarify")
+        log(f"[#{n}] summarize -> {len(questions)} question(s), flow:clarify")
 
 
 def handle_clarify(gh, ledger, issue):

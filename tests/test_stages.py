@@ -565,3 +565,64 @@ def test_review_approve_moves_unit_to_merge(monkeypatch):
     stages.handle_review(gh, None, {"number": 1, "title": "T"})
     assert saved["spec_units"][0]["stage"] == "merge"
     assert gh.flow == stages.config.FLOW_MERGE
+
+
+# ── summarize: don't post an empty "(clarify)" placeholder ────────────────────
+class _SumGH:
+    def __init__(self):
+        self.flow = None
+        self.labels = []
+        self.comments = []
+
+    def list_comments(self, n):
+        return []
+
+    def comment(self, n, body, **k):
+        self.comments.append(body)
+
+    def set_flow(self, n, flow, issue=None):
+        self.flow = flow
+
+    def add_labels(self, n, names):
+        self.labels += names
+
+
+def _sum_env(monkeypatch, res):
+    monkeypatch.setattr(stages, "_run", lambda *a, **k: ("claude", res))
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.instructions, "load", lambda step, path: "")
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: None)
+
+
+def test_summarize_escalates_when_output_does_not_parse(monkeypatch):
+    # The exact #5 failure: a long run that ended in prose, nothing parsed.
+    _sum_env(monkeypatch, RunResult(ok=True, text="I dug through the repo... here's my take.",
+                                    data={}))
+    gh = _SumGH()
+    stages.handle_summarize(gh, None, {"number": 5, "title": "T"})
+    assert gh.flow != stages.config.FLOW_CLARIFY          # NOT an empty clarify
+    assert stages.config.FLAG_NEEDS_HUMAN in gh.labels    # paused for a human
+    body = "\n".join(gh.comments)
+    assert "(clarify)" not in body                        # no useless placeholder
+    assert "here's my take" in body                       # surfaces the real output
+
+
+def test_summarize_escalates_on_empty_clarify(monkeypatch):
+    # Parsed, but status=clarify with neither summary nor questions -> still useless.
+    _sum_env(monkeypatch, RunResult(ok=True, text="x",
+                                    data={"status": "clarify", "questions": []}))
+    gh = _SumGH()
+    stages.handle_summarize(gh, None, {"number": 5, "title": "T"})
+    assert stages.config.FLAG_NEEDS_HUMAN in gh.labels
+    assert "- (clarify)" not in "\n".join(gh.comments)
+
+
+def test_summarize_still_posts_real_questions(monkeypatch):
+    _sum_env(monkeypatch, RunResult(ok=True, text="",
+                                    data={"status": "clarify", "summary": "S",
+                                          "questions": ["Which tier?", "Worktrees ok?"]}))
+    gh = _SumGH()
+    stages.handle_summarize(gh, None, {"number": 5, "title": "T"})
+    assert gh.flow == stages.config.FLOW_CLARIFY
+    body = "\n".join(gh.comments)
+    assert "Which tier?" in body and "Worktrees ok?" in body
