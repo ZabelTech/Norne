@@ -41,6 +41,45 @@ def test_parse_structured_with_nested_braces():
     assert runners.parse_structured(text) == payload
 
 
+# ── tolerant fallback: recover JSON the run emitted but didn't fence cleanly ──
+def test_parse_structured_recovers_unfenced_trailing_object():
+    # The model ended in prose and just printed the object — no ```json fence.
+    text = ('I dug through the repo and here is my result:\n'
+            '{"status": "done", "summary": "did the thing"}\n'
+            'Let me know if you need anything else.')
+    assert runners.parse_structured(text) == {"status": "done",
+                                              "summary": "did the thing"}
+
+
+def test_parse_structured_recovers_when_closing_fence_is_missing():
+    # Truncated/garbled fence: opener present, closing ``` lost.
+    text = 'reasoning…\n```json\n{"status": "ready", "n": 2}'
+    assert runners.parse_structured(text) == {"status": "ready", "n": 2}
+
+
+def test_parse_structured_takes_last_object_ignoring_prose_braces():
+    # A brace-y aside earlier, the real answer last.
+    text = ('I considered returning {status: done} but reconsidered.\n'
+            '{"status": "request_changes", "comments": ["fix {the} lock"]}')
+    assert runners.parse_structured(text) == {
+        "status": "request_changes", "comments": ["fix {the} lock"]}
+
+
+def test_parse_structured_tolerates_trailing_commas():
+    assert runners.parse_structured('```json\n{"a": 1, "b": [2, 3,],}\n```') == \
+        {"a": 1, "b": [2, 3]}
+
+
+def test_parse_structured_fenced_beats_unfenced():
+    # When both exist, the contract fence wins over a stray earlier object.
+    text = '{"status": "stale"}\n```json\n{"status": "fresh"}\n```'
+    assert runners.parse_structured(text) == {"status": "fresh"}
+
+
+def test_parse_structured_still_empty_on_pure_prose():
+    assert runners.parse_structured("no json, just words and a } stray brace") == {}
+
+
 # ── _claude_cc_json ─────────────────────────────────────────────────────────
 def test_claude_cc_json_parses_result_and_usage():
     line = json.dumps({

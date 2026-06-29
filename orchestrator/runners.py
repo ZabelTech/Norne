@@ -43,15 +43,64 @@ _JSON_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 _RL_HINT = re.compile(r"rate.?limit|429|overloaded|quota.*exceed|usage limit", re.I)
 
 
-def parse_structured(text):
-    """Pull the LAST ```json {...} ``` block out of a model reply."""
-    blocks = _JSON_BLOCK.findall(text or "")
-    if not blocks:
-        return {}
+def _loads(s):
+    """json.loads, tolerating trailing commas (a common model slip). None on fail."""
     try:
-        return json.loads(blocks[-1])
+        return json.loads(s)
     except json.JSONDecodeError:
+        fixed = re.sub(r",(\s*[}\]])", r"\1", s)        # drop trailing commas
+        if fixed != s:
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+        return None
+
+
+def _balanced_objects(text):
+    """Every top-level {...} substring in `text`, in document order, respecting
+    string literals and escapes (so braces inside strings don't miscount)."""
+    out, depth, start, in_str, esc = [], 0, -1, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                out.append(text[start:i + 1])
+    return out
+
+
+def parse_structured(text):
+    """Pull the result object out of a model reply, tolerantly. Prefer the LAST
+    ```json fenced block (the contract — and the only fence the two-layer
+    instruction loader leaves as ```json, so injected examples can't hijack it);
+    fall back to the LAST balanced {...} object anywhere in the reply. The
+    fallback recovers a run that emitted the JSON but dropped/broke the closing
+    fence, trailed prose after it, or otherwise lost the exact contract."""
+    if not text:
         return {}
+    for blk in reversed(_JSON_BLOCK.findall(text)):       # preferred: fenced
+        obj = _loads(blk)
+        if isinstance(obj, dict):
+            return obj
+    for blk in reversed(_balanced_objects(text)):         # fallback: bare object
+        obj = _loads(blk)
+        if isinstance(obj, dict) and obj:                 # skip stray {} / non-dicts
+            return obj
+    return {}
 
 
 def _run(cmd, cwd, env, pool):
