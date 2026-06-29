@@ -136,21 +136,35 @@ def _record(ledger, fam, res):
 
 
 def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
-    """Route -> run -> meter. Raises BudgetParked if nothing has headroom."""
-    fam = router.choose_family(stage, ledger, exclude_family=exclude_family)
-    if fam is None:
-        log(f"  {stage}: no model family has budget headroom -> parking")
-        raise BudgetParked()
-    model = _model_for(stage, fam)
-    effort = config.effort_for(model)
-    log(f"  {stage}: calling {fam}/{model} ({effort})…")
-    t0 = time.time()
-    runner = runners.get_runner(fam)
-    res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
-    _record(ledger, fam, res)
-    log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
-        f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
-    return fam, res
+    """Route -> run -> meter. When a family is actually rate-limited by its
+    provider, cool it down and fall back to any other eligible family; park
+    (BudgetParked) only once EVERY family is out of budget / cooling."""
+    tried = set()
+    while True:
+        fam = router.choose_family(stage, ledger, exclude_family=exclude_family,
+                                   skip=tried)
+        if fam is None:
+            why = (f"all families out of budget after {', '.join(sorted(tried))} "
+                   "rate-limited") if tried else "no model family has budget headroom"
+            log(f"  {stage}: {why} -> parking")
+            raise BudgetParked()
+        model = _model_for(stage, fam)
+        effort = config.effort_for(model)
+        log(f"  {stage}: calling {fam}/{model} ({effort})…")
+        t0 = time.time()
+        runner = runners.get_runner(fam)
+        try:
+            res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
+        except RateLimited:
+            ledger.cool_down(fam, config.RATE_LIMIT_COOLDOWN)
+            tried.add(fam)
+            log(f"  {stage}: {fam} rate-limited by provider -> cooling "
+                f"{config.RATE_LIMIT_COOLDOWN}s, falling back to another family")
+            continue
+        _record(ledger, fam, res)
+        log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
+            f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
+        return fam, res
 
 
 def _build_prompt(template, step, path, **tokens):

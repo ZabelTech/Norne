@@ -87,9 +87,24 @@ class Ledger:
             p[w]["prompts"] += prompts
         self._save()
 
+    def cool_down(self, pool, seconds):
+        """Back a pool off after a real provider rate-limit. Independent of the
+        local window counters (which can't see the provider's own quota), so the
+        router stops re-picking the family and the blocked:budget gate stops
+        un-parking until the cooldown expires."""
+        self.d[pool]["cooldown_until"] = time.time() + seconds
+        self._save()
+
+    def cooling(self, pool):
+        """True while a pool is backed off from a provider rate-limit."""
+        return time.time() < self.d.get(pool, {}).get("cooldown_until", 0)
+
     def headroom(self, pool):
-        """True if this pool has room for another step in both windows."""
+        """True if this pool has room for another step in both windows (and is
+        not currently cooling off from a provider rate-limit)."""
         self._roll()
+        if self.cooling(pool):
+            return False
         f = config.BUDGET_SAFETY_FRACTION
         p = self.d[pool]
         if pool == "claude":

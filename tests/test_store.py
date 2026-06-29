@@ -69,6 +69,23 @@ def test_weekly_window_survives_a_five_hour_roll(fresh_ledger, clock):
     assert fresh_ledger.d["claude"]["wk"]["tokens"] == 400  # weekly persists
 
 
+def test_cool_down_blocks_headroom_until_it_expires(fresh_ledger, clock):
+    assert fresh_ledger.headroom("glm") is True
+    fresh_ledger.cool_down("glm", 600)
+    assert fresh_ledger.cooling("glm") is True
+    assert fresh_ledger.headroom("glm") is False         # backed off despite empty counters
+    assert fresh_ledger.headroom("claude") is True       # other pool unaffected
+    clock.advance(601)
+    assert fresh_ledger.cooling("glm") is False
+    assert fresh_ledger.headroom("glm") is True          # auto-recovers after the window
+
+
+def test_cool_down_persists_across_ledger_instances(fresh_ledger, clock, ledger_paths):
+    fresh_ledger.cool_down("glm", 600)
+    # A fresh Ledger view (as the worker creates per issue) still sees the cooldown.
+    assert store.Ledger().headroom("glm") is False
+
+
 def test_next_reset_points_at_the_soonest_window(fresh_ledger, clock):
     nxt = fresh_ledger.next_reset()
     # The 5h window opened at clock start (== now), so it frees up first.

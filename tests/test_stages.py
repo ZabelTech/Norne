@@ -177,7 +177,7 @@ def test_run_forwards_exclude_family(monkeypatch):
     led = RecordingLedger()
     captured = {}
 
-    def fake_choose(stage, ledger, exclude_family=None):
+    def fake_choose(stage, ledger, exclude_family=None, skip=None):
         captured["exclude"] = exclude_family
         return "glm"
 
@@ -186,6 +186,58 @@ def test_run_forwards_exclude_family(monkeypatch):
                         lambda fam: StubRunner("glm", RunResult(ok=True, text="")))
     stages._run("review", led, "P", cwd="/w", exclude_family="claude")
     assert captured["exclude"] == "claude"
+
+
+class _RLRunner:
+    """A runner that raises RateLimited for named families, else returns ok."""
+    def __init__(self, family, rate_limited):
+        self.family = family
+        self._rl = rate_limited
+
+    def run(self, prompt, cwd, write=False, model=None, effort="medium"):
+        if self.family in self._rl:
+            raise stages.RateLimited(self.family)
+        return RunResult(ok=True, text="", input_tokens=1, output_tokens=1)
+
+
+def test_run_falls_back_to_another_family_when_one_is_rate_limited(monkeypatch):
+    # glm is rate-limited by the provider -> cool it down, fall back to claude.
+    led = RecordingLedger()
+    cooled = []
+    led.cool_down = lambda pool, seconds: cooled.append((pool, seconds))
+    order = ["glm", "claude"]
+
+    def choose(stage, ledger, exclude_family=None, skip=None):
+        for f in order:
+            if f not in (skip or set()):
+                return f
+        return None
+
+    monkeypatch.setattr(stages.router, "choose_family", choose)
+    monkeypatch.setattr(stages.runners, "get_runner",
+                        lambda fam: _RLRunner(fam, {"glm"}))
+    fam, res = stages._run("implement", led, "P", cwd="/w", write=True)
+    assert fam == "claude"                               # fell back
+    assert res.ok
+    assert cooled and cooled[0][0] == "glm"              # glm cooled down
+
+
+def test_run_parks_only_when_all_families_rate_limited(monkeypatch):
+    led = RecordingLedger()
+    led.cool_down = lambda pool, seconds: None
+    order = ["glm", "claude"]
+
+    def choose(stage, ledger, exclude_family=None, skip=None):
+        for f in order:
+            if f not in (skip or set()):
+                return f
+        return None
+
+    monkeypatch.setattr(stages.router, "choose_family", choose)
+    monkeypatch.setattr(stages.runners, "get_runner",
+                        lambda fam: _RLRunner(fam, {"glm", "claude"}))
+    with pytest.raises(stages.BudgetParked):
+        stages._run("implement", led, "P", cwd="/w", write=True)
 
 
 # ── review-round attribution ────────────────────────────────────────────────

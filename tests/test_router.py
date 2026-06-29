@@ -33,6 +33,22 @@ def test_returns_none_when_no_pool_has_headroom():
     assert router.choose_family("review", led) is None
 
 
+def test_skip_excludes_a_family_so_caller_can_fall_back():
+    led = FakeLedger({"claude": True, "glm": True})
+    # implement prefers glm; skipping it (already rate-limited this run) -> claude.
+    assert router.choose_family("implement", led, skip={"glm"}) == "claude"
+    # skipping every family -> nothing left to pick.
+    assert router.choose_family("implement", led, skip={"glm", "claude"}) is None
+
+
+def test_skip_also_suppresses_the_same_family_review_fallback():
+    # Only the excluded family has headroom, but it's been skipped (rate-limited)
+    # -> no same-family degrade, park instead.
+    led = FakeLedger({"claude": True, "glm": False})
+    assert router.choose_family("review", led, exclude_family="claude",
+                                skip={"claude"}) is None
+
+
 def test_exclude_family_enforces_a_different_reviewer():
     led = FakeLedger({"claude": True, "glm": True})
     # review prefers claude, but if claude implemented, pick the other family.

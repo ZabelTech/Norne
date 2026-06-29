@@ -62,6 +62,11 @@ GLM_TIER_LIMITS = {
 GLM_QUOTA_MULTIPLIER = float(os.environ.get("GLM_QUOTA_MULTIPLIER", "2.0"))
 # leave headroom so we park before slamming the wall
 BUDGET_SAFETY_FRACTION = float(os.environ.get("BUDGET_SAFETY_FRACTION", "0.85"))
+# When a provider actually rate-limits a family (z.ai 429 / overloaded), back
+# that family off for this long. The LOCAL ledger can't see the provider's real
+# quota, so without a cooldown the blocked:budget gate un-parks on stale local
+# headroom and retries the same dead family every poll (a tight thrash loop).
+RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "600"))  # 10 min
 
 # ── State machine: one flow:* label = where an issue is right now ──────────
 FLOW_SUMMARIZE = "flow:summarize"
