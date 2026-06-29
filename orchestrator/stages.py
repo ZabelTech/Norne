@@ -481,8 +481,9 @@ def handle_review(gh, ledger, issue):
     tok = res.input_tokens + res.output_tokens
     status = res.data.get("status")
     if status == "approve":
-        gh.comment(n, f"✅ **Review passed** for `{u['slug']}` (PR #{u['pr_number']}, "
-                      f"by {fam}).\n\n{res.data.get('summary','')}",
+        # Review feedback goes on the PR (the code under review), not the issue.
+        gh.comment(u["pr_number"], f"✅ **Review passed** (by {fam}).\n\n"
+                                   f"{res.data.get('summary','')}",
                    model=model, effort=effort, tokens=tok)
         u["stage"] = "merge"
         _save_units(n, units)
@@ -498,8 +499,9 @@ def handle_review(gh, ledger, issue):
             return
         fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
              res.data.get("summary", "")
-        gh.comment(n, f"🔁 **Changes requested** on `{u['slug']}` (round {rnd}, "
-                      f"by {fam}):\n{fb}", model=model, effort=effort, tokens=tok)
+        # Review feedback goes on the PR (the code under review), not the issue.
+        gh.comment(u["pr_number"], f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}",
+                   model=model, effort=effort, tokens=tok)
         u["review_round"], u["last_feedback"], u["stage"] = rnd, fb, "implement"
         _save_units(n, units)
         log(f"[#{n}] review {u['slug']}: changes requested (round {rnd}, by {fam})")

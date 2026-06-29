@@ -450,6 +450,7 @@ class _FanGH:
         self.closed = []
         self._pulls = pulls or {}                 # branch -> existing PR (or none)
         self._by_number = {}
+        self.comment_calls = []                    # (target_number, body)
 
     def default_branch(self):
         return self.default
@@ -462,6 +463,7 @@ class _FanGH:
 
     def comment(self, n, body, **k):
         self.comments.append(body)
+        self.comment_calls.append((n, body))
 
     def pull_for_branch(self, branch):
         return self._pulls.get(branch)
@@ -596,6 +598,31 @@ def test_review_approve_moves_unit_to_merge(monkeypatch):
     stages.handle_review(gh, None, {"number": 1, "title": "T"})
     assert saved["spec_units"][0]["stage"] == "merge"
     assert gh.flow == stages.config.FLOW_MERGE
+    # The review verdict is posted on the PR (#201), never on the issue (#1).
+    targets = [t for t, _ in gh.comment_calls]
+    assert 201 in targets and 1 not in targets
+
+
+def test_review_request_changes_comments_on_the_pr(monkeypatch):
+    units = [{"slug": "a", "title": "A", "branch": "b/a", "spec": _two_specs()[0],
+              "stage": "review", "pr_number": 201, "review_round": 0,
+              "last_feedback": None, "implementer": "glm"}]
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: None)
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages.repo, "checkout_branch", lambda *a: None)
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
+    monkeypatch.setattr(stages, "_run", lambda *a, **k:
+                        ("claude", RunResult(ok=True, text="",
+                                             data={"status": "request_changes",
+                                                   "comments": ["fix the lock"]})))
+    gh = _FanGH()
+    stages.handle_review(gh, None, {"number": 1, "title": "T"})
+    target, body = gh.comment_calls[-1]
+    assert target == 201                                 # on the PR, not issue #1
+    assert "Changes requested" in body and "fix the lock" in body
+    assert gh.flow == stages.config.FLOW_IMPLEMENT       # bounced back to implement
 
 
 # ── summarize: don't post an empty "(clarify)" placeholder ────────────────────
