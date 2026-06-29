@@ -105,11 +105,13 @@ class Ledger:
         self._roll()
         if self.cooling(pool):
             return False
-        f = config.BUDGET_SAFETY_FRACTION
         p = self.d[pool]
         if pool == "claude":
-            return (p["w5"]["tokens"] < config.CLAUDE_5H_TOKEN_BUDGET * f and
-                    p["wk"]["tokens"] < config.CLAUDE_WEEK_TOKEN_BUDGET * f)
+            # Per-window ceilings: hotter on the fast-refilling 5h window, more
+            # protective on the weekly cap.
+            return (p["w5"]["tokens"] < config.CLAUDE_5H_TOKEN_BUDGET * config.CLAUDE_5H_SAFETY_FRACTION and
+                    p["wk"]["tokens"] < config.CLAUDE_WEEK_TOKEN_BUDGET * config.CLAUDE_WEEK_SAFETY_FRACTION)
+        f = config.BUDGET_SAFETY_FRACTION
         lim = config.GLM_TIER_LIMITS[config.GLM_TIER]
         return (p["w5"]["prompts"] < lim["per5h"] * f and
                 p["wk"]["prompts"] < lim["perweek"] * f)

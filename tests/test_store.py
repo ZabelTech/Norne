@@ -28,17 +28,20 @@ def test_record_glm_prompts_accumulate(fresh_ledger):
     assert fresh_ledger.d["glm"]["wk"]["prompts"] == 3
 
 
-def test_claude_headroom_respects_safety_fraction(fresh_ledger):
-    # Budget 1000 * safety 0.85 = 850 soft ceiling for the 5h window.
-    fresh_ledger.record("claude", tokens=849)
+def test_claude_5h_window_respects_its_safety_fraction(fresh_ledger):
+    # Budget 1000 * CLAUDE_5H_SAFETY_FRACTION 0.90 = 900 soft 5h ceiling.
+    fresh_ledger.record("claude", tokens=899)
     assert fresh_ledger.headroom("claude") is True
-    fresh_ledger.record("claude", tokens=1)  # now at 850, not < 850
+    fresh_ledger.record("claude", tokens=1)  # now at 900, not < 900
     assert fresh_ledger.headroom("claude") is False
 
 
-def test_claude_weekly_window_can_block_independently(fresh_ledger):
-    # Spend under the 5h ceiling but over the weekly one by faking the weekly tally.
-    fresh_ledger.d["claude"]["wk"]["tokens"] = 9000  # > 10000 * 0.85
+def test_claude_weekly_window_uses_its_own_lower_fraction(fresh_ledger):
+    # Weekly cap is protected harder: 10000 * CLAUDE_WEEK_SAFETY_FRACTION 0.80 = 8000.
+    fresh_ledger.d["claude"]["wk"]["tokens"] = 7999
+    fresh_ledger._save()
+    assert fresh_ledger.headroom("claude") is True       # under the weekly ceiling
+    fresh_ledger.d["claude"]["wk"]["tokens"] = 8000      # at the ceiling -> blocked
     fresh_ledger._save()
     assert fresh_ledger.headroom("claude") is False
 

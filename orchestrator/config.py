@@ -60,8 +60,18 @@ GLM_TIER_LIMITS = {
     "max":  {"per5h": 1600, "perweek": 8000},
 }
 GLM_QUOTA_MULTIPLIER = float(os.environ.get("GLM_QUOTA_MULTIPLIER", "2.0"))
-# leave headroom so we park before slamming the wall
+# leave headroom so we park before slamming the wall (GLM + the default)
 BUDGET_SAFETY_FRACTION = float(os.environ.get("BUDGET_SAFETY_FRACTION", "0.85"))
+# Claude gets its own per-window ceilings: a higher 5h fraction (short window
+# refills fast, so we can run it hotter) and a lower weekly one (the weekly cap
+# is the real ceiling — protect it harder).
+CLAUDE_5H_SAFETY_FRACTION = float(os.environ.get("CLAUDE_5H_SAFETY_FRACTION", "0.90"))
+CLAUDE_WEEK_SAFETY_FRACTION = float(os.environ.get("CLAUDE_WEEK_SAFETY_FRACTION", "0.80"))
+# Cache-READ tokens are re-counted every agentic turn and priced ~0.1x; counting
+# them at full weight is what made the local ledger over-count ~10x vs the real
+# subscription. Weight them down so the gate tracks effective usage, not cache
+# churn. (cache-CREATION is a real write at ~1.25x, counted at full weight.)
+CLAUDE_CACHE_READ_WEIGHT = float(os.environ.get("CLAUDE_CACHE_READ_WEIGHT", "0.1"))
 # When a provider actually rate-limits a family (z.ai 429 / overloaded), back
 # that family off for this long. The LOCAL ledger can't see the provider's real
 # quota, so without a cooldown the blocked:budget gate un-parks on stale local

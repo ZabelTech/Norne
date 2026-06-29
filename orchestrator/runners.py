@@ -97,7 +97,13 @@ def _apply_effort(prompt, effort, write=False):
 
 
 def _claude_cc_json(stdout):
-    """Parse `claude -p --output-format json` -> (final_text, in_tok, out_tok)."""
+    """Parse `claude -p --output-format json` -> (final_text, in_tok, out_tok).
+
+    `in_tok` is an *effective* input count for the budget gate: fresh input +
+    cache-creation at full weight, plus cache-READS weighted down
+    (config.CLAUDE_CACHE_READ_WEIGHT). Cache reads are re-counted every turn and
+    priced ~0.1x, so charging them at 1x over-counts a long agentic run ~10x vs
+    the real subscription — the bug that wrongly parked Claude."""
     text, itok, otok = "", 0, 0
     try:
         obj = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
@@ -105,7 +111,9 @@ def _claude_cc_json(stdout):
         return stdout, 0, 0
     text = obj.get("result") or obj.get("text") or ""
     usage = obj.get("usage") or {}
-    itok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+    itok = (usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + int(config.CLAUDE_CACHE_READ_WEIGHT * usage.get("cache_read_input_tokens", 0)))
     otok = usage.get("output_tokens", 0)
     return text, itok, otok
 
