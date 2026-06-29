@@ -133,9 +133,9 @@ class StubRunner:
         self._result = result
         self.seen = {}
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None, resume=None):
         self.seen = {"prompt": prompt, "cwd": cwd, "write": write,
-                     "model": model, "effort": effort, "schema": schema}
+                     "model": model, "effort": effort, "schema": schema, "resume": resume}
         return self._result
 
 
@@ -151,6 +151,7 @@ def test_run_routes_records_and_returns_family(monkeypatch):
     assert res is result
     assert runner.seen["prompt"] == "PROMPT"
     assert runner.seen["cwd"] == "/work"
+    assert runner.seen["resume"] is None  # no resume passed
     # claude stage runs with its pinned per-stage Claude model
     assert runner.seen["model"] == config.CLAUDE_MODEL_BY_STAGE["spec"]
     # With the new reserve/reconcile API:
@@ -242,13 +243,58 @@ def test_run_forwards_exclude_family(monkeypatch):
     assert captured["exclude"] == "claude"
 
 
+def test_run_forwards_resume_id_when_family_matches(monkeypatch):
+    """When resume family matches the chosen family, forward the session id."""
+    led = RecordingLedger()
+    runner = StubRunner("claude", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    resume_dict = {"family": "claude", "id": "sess-abc123"}
+    fam, res = stages._run("spec", led, "PROMPT", cwd="/w", resume=resume_dict)
+    assert runner.seen["resume"] == "sess-abc123"
+
+
+def test_run_skips_resume_when_family_mismatch(monkeypatch):
+    """When resume family doesn't match the chosen family, don't forward the id."""
+    led = RecordingLedger()
+    runner = StubRunner("glm", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "glm")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    # Resume is for claude but router picks glm
+    resume_dict = {"family": "claude", "id": "sess-abc123"}
+    fam, res = stages._run("spec", led, "PROMPT", cwd="/w", resume=resume_dict)
+    assert runner.seen["resume"] is None  # not forwarded due to family mismatch
+
+
+def test_run_handles_missing_resume_fields(monkeypatch):
+    """Gracefully handle resume dict with missing or None fields."""
+    led = RecordingLedger()
+    runner = StubRunner("claude", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    # Missing "id" field
+    stages._run("spec", led, "PROMPT", cwd="/w", resume={"family": "claude"})
+    assert runner.seen["resume"] is None
+
+    # Missing "family" field
+    stages._run("spec", led, "PROMPT", cwd="/w", resume={"id": "sess-abc"})
+    assert runner.seen["resume"] is None
+
+    # None resume
+    stages._run("spec", led, "PROMPT", cwd="/w", resume=None)
+    assert runner.seen["resume"] is None
+
+
 class _RLRunner:
     """A runner that raises RateLimited for named families, else returns ok."""
     def __init__(self, family, rate_limited):
         self.family = family
         self._rl = rate_limited
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None, resume=None):
         if self.family in self._rl:
             raise stages.RateLimited(self.family)
         return RunResult(ok=True, text="", input_tokens=1, output_tokens=1)
