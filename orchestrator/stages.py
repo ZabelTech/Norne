@@ -136,7 +136,7 @@ def _record(ledger, fam, res):
         ledger.record("glm", prompts=math.ceil(config.GLM_QUOTA_MULTIPLIER))
 
 
-def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False, schema=None):
+def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False, schema=None, resume=None):
     """Route -> reserve -> run -> reconcile. Reserve pre-charges an estimate so
     the budget gate is atomic under concurrent runs; reconcile corrects to actual
     usage after. When a family is actually rate-limited by its provider, refund
@@ -154,6 +154,12 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False, schema=No
         model = _model_for(stage, fam)
         effort = config.effort_for(model)
 
+        # Compute resume_id: only forward the id when the chosen family matches
+        # the stored session's family. This makes failover automatically safe.
+        resume_id = None
+        if resume and resume.get("family") == fam and resume.get("id"):
+            resume_id = resume["id"]
+
         # Reserve an estimate before the run (atomic gate for concurrency).
         if fam == "claude":
             reserved_tokens, reserved_prompts = config.CLAUDE_RESERVE_TOKENS, 0
@@ -170,7 +176,7 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False, schema=No
         runner = runners.get_runner(fam)
         try:
             res = runner.run(prompt, cwd=cwd, write=write, model=model,
-                             effort=effort, schema=schema)
+                             effort=effort, schema=schema, resume=resume_id)
         except RateLimited:
             # The run didn't happen: refund the reservation, cool the pool, fall back.
             ledger.reconcile(fam, reserved_tokens=reserved_tokens,
@@ -300,9 +306,13 @@ def handle_spec(gh, ledger, issue):
     rnd = meta.get("spec_round", 0) + 1
     feedback = meta.get("spec_feedback") or "(none)"
 
+    # Build resume dict for author: resume from round 0's session when rnd > 0
+    author_resume = meta.get("spec_author_session") if rnd > 1 else None
+
     fam, res = _run("spec", ledger, _build_prompt(prompts.SPEC, "spec", path, NUM=n,
                     TITLE=issue["title"], SUMMARY=summary, DISCUSSION=discussion,
-                    FEEDBACK=feedback), cwd=path, schema=prompts.SPEC_SCHEMA)
+                    FEEDBACK=feedback), cwd=path, schema=prompts.SPEC_SCHEMA,
+                    resume=author_resume)
     author = _participant("spec", fam, res)
     d = res.data
     if d.get("status") != "ready" or not d.get("specs"):
@@ -316,17 +326,26 @@ def handle_spec(gh, ledger, issue):
                        round_note=f"🔎 Spec round {rnd} — author {author} ({why}).")
         return
     specs = d["specs"]
+    # Persist the author session for resumption on subsequent rounds
+    if res.session_id:
+        update_issue_meta(n, spec_author_session={"family": fam, "id": res.session_id})
     # the author's replies to last round's concerns (resolved or rebutted)
     responses = "\n".join(f"- {r}" for r in (d.get("responses") or [])) \
         or "(none — first review)"
     # diversity-of-thought: a DIFFERENT family peer-reviews the specs, weighing
     # the author's responses so a sound rebuttal isn't re-raised.
+    # Build resume dict for reviewer: resume from previous reviewer session when looping
+    reviewer_resume = meta.get("spec_reviewer_session") if rnd > 1 else None
     rfam, rev = _run("review", ledger, _build_prompt(prompts.SPEC_REVIEW,
                      "spec_review", path, SPECS=_specs_text(specs),
                      AUTHOR_RESPONSES=responses, DISCUSSION=discussion),
-                     cwd=path, exclude_family=fam, schema=prompts.SPEC_REVIEW_SCHEMA)
+                     cwd=path, exclude_family=fam, schema=prompts.SPEC_REVIEW_SCHEMA,
+                     resume=reviewer_resume)
     reviewer = _participant("review", rfam, rev)
     note = f"🔎 Spec round {rnd} — author {author} · reviewer {reviewer}"
+    # Persist the reviewer session for resumption on subsequent rounds
+    if rev.session_id:
+        update_issue_meta(n, spec_reviewer_session={"family": rfam, "id": rev.session_id})
     concerns = rev.data.get("concerns") or []
     if rev.data.get("verdict") != "concerns" or not concerns:
         _reset_spec_loop(n)
@@ -360,7 +379,8 @@ def handle_spec(gh, ledger, issue):
 
 
 def _reset_spec_loop(n):
-    update_issue_meta(n, spec_round=0, spec_feedback=None)
+    update_issue_meta(n, spec_round=0, spec_feedback=None,
+                    spec_author_session=None, spec_reviewer_session=None)
 
 
 def _slug(spec, idx):
@@ -518,12 +538,18 @@ def handle_implement(gh, ledger, issue):
                                        DISCUSSION=discussion)
             log(f"[#{n}] implement {slug}: "
                 f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
+            # Build resume dict for fix rounds: resume from the unit's first-pass session
+            implement_resume = u.get("implement_session") if rnd > 0 else None
             fam, res = _run("implement", ledger, prompt, cwd=path, write=True,
-                            schema=prompts.IMPLEMENT_SCHEMA)
+                            schema=prompts.IMPLEMENT_SCHEMA, resume=implement_resume)
 
             if res.data.get("status") != "done":
                 reason = _implement_escalation(res, path, base)
                 return {"slug": slug, "status": "escalate", "reason": reason}
+
+            # Persist the implement session for resumption on fix rounds
+            if res.session_id:
+                _update_unit(n, slug, implement_session={"family": fam, "id": res.session_id})
 
             repo.commit_all(path, f"implement #{n} {slug}"
                             + (f" (fix round {rnd})" if rnd else ""))

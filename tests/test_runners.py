@@ -86,11 +86,12 @@ def test_claude_cc_json_parses_result_and_usage():
         "result": "the answer",
         "usage": {"input_tokens": 100, "output_tokens": 30},
     })
-    text, itok, otok, structured = runners._claude_cc_json(line)
+    text, itok, otok, structured, session_id = runners._claude_cc_json(line)
     assert text == "the answer"
     assert itok == 100
     assert otok == 30
     assert structured is None                            # no --json-schema run
+    assert session_id == ""
 
 
 def test_claude_cc_json_discounts_cache_reads_and_counts_cache_writes():
@@ -100,9 +101,10 @@ def test_claude_cc_json_discounts_cache_reads_and_counts_cache_writes():
         "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20,
                   "cache_read_input_tokens": 900, "output_tokens": 5},
     })
-    _, itok, otok, _ = runners._claude_cc_json(line)
+    _, itok, otok, _, session_id = runners._claude_cc_json(line)
     assert itok == 10 + 20 + int(0.1 * 900)              # 10 + 20 + 90 = 120
     assert otok == 5
+    assert session_id == ""
 
 
 def test_claude_cc_json_cache_read_heavy_run_is_not_over_counted():
@@ -113,35 +115,39 @@ def test_claude_cc_json_cache_read_heavy_run_is_not_over_counted():
         "usage": {"input_tokens": 1000, "cache_read_input_tokens": 5_000_000,
                   "output_tokens": 2000},
     })
-    _, itok, _, _ = runners._claude_cc_json(line)
+    _, itok, _, _, session_id = runners._claude_cc_json(line)
     assert itok == 1000 + int(0.1 * 5_000_000)           # 501000, not 5_001_000
     assert itok < 600_000
+    assert session_id == ""
 
 
 def test_claude_cc_json_uses_last_line():
     stdout = "noise\n" + json.dumps({"result": "final", "usage": {}})
-    text, itok, otok, _ = runners._claude_cc_json(stdout)
+    text, itok, otok, _, session_id = runners._claude_cc_json(stdout)
     assert text == "final"
     assert (itok, otok) == (0, 0)
+    assert session_id == ""
 
 
 def test_claude_cc_json_falls_back_on_garbage():
-    text, itok, otok, structured = runners._claude_cc_json("not json at all")
+    text, itok, otok, structured, session_id = runners._claude_cc_json("not json at all")
     assert text == "not json at all"
     assert (itok, otok) == (0, 0)
     assert structured is None
+    assert session_id == ""
 
 
 def test_claude_cc_json_handles_empty():
-    text, itok, otok, structured = runners._claude_cc_json("")
-    assert (text, itok, otok, structured) == ("", 0, 0, None)
+    text, itok, otok, structured, session_id = runners._claude_cc_json("")
+    assert (text, itok, otok, structured, session_id) == ("", 0, 0, None, "")
 
 
 def test_claude_cc_json_prefers_text_key_when_no_result():
     line = json.dumps({"text": "fallback", "usage": {"output_tokens": 2}})
-    text, _, otok, _ = runners._claude_cc_json(line)
+    text, _, otok, _, session_id = runners._claude_cc_json(line)
     assert text == "fallback"
     assert otok == 2
+    assert session_id == ""
 
 
 def test_claude_cc_json_returns_structured_output_when_present():
@@ -151,9 +157,10 @@ def test_claude_cc_json_returns_structured_output_when_present():
         "structured_output": {"status": "ok", "n": 3},
         "usage": {"input_tokens": 5, "output_tokens": 2},
     })
-    text, _, _, structured = runners._claude_cc_json(line)
+    text, _, _, structured, session_id = runners._claude_cc_json(line)
     assert text == '{"status": "ok", "n": 3}'
     assert structured == {"status": "ok", "n": 3}
+    assert session_id == ""
 
 
 # ── _data_from: structured_output wins, text parse is the fallback ───────────
@@ -352,3 +359,142 @@ def test_glm_runner_never_forwards_json_schema(monkeypatch):
     assert "--json-schema" not in captured["cmd"]
     # It still reads structured_output if the endpoint happens to return it.
     assert res.data == {"status": "ready"}
+
+
+# ── session_id capture and resumption ───────────────────────────────────────────
+def test_claude_cc_json_extracts_session_id():
+    line = json.dumps({
+        "result": "ok",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+        "session_id": "sess-abc123",
+    })
+    text, itok, otok, structured, session_id = runners._claude_cc_json(line)
+    assert text == "ok"
+    assert session_id == "sess-abc123"
+
+
+def test_claude_cc_json_defaults_session_id_to_empty_string():
+    line = json.dumps({
+        "result": "ok",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    })
+    _, _, _, _, session_id = runners._claude_cc_json(line)
+    assert session_id == ""
+
+
+def test_claude_cc_json_tolerates_null_session_id():
+    line = json.dumps({
+        "result": "ok",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+        "session_id": None,
+    })
+    _, _, _, _, session_id = runners._claude_cc_json(line)
+    assert session_id == ""
+
+
+def test_run_result_session_id_defaults_to_empty_string():
+    res = runners.RunResult(ok=True, text="done")
+    assert res.session_id == ""
+
+
+def test_claude_runner_adds_resume_flag_when_set(monkeypatch):
+    captured = {}
+
+    def fake(cmd, cwd, env, pool):
+        captured["cmd"] = cmd
+        return _FakeProc(json.dumps({
+            "result": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "session_id": "sess-new",
+        })), "blob"
+
+    monkeypatch.setattr(runners, "_run", fake)
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    runners.ClaudeCodeRunner().run("PROMPT", cwd=".", resume="sess-abc123")
+    assert "--resume" in captured["cmd"]
+    assert "sess-abc123" in captured["cmd"]
+
+
+def test_claude_runner_skips_resume_flag_when_not_set(monkeypatch):
+    captured = {}
+
+    def fake(cmd, cwd, env, pool):
+        captured["cmd"] = cmd
+        return _FakeProc(json.dumps({
+            "result": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })), "blob"
+
+    monkeypatch.setattr(runners, "_run", fake)
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    runners.ClaudeCodeRunner().run("PROMPT", cwd=".")
+    assert "--resume" not in captured["cmd"]
+
+
+def test_claude_runner_fallback_on_stale_session(monkeypatch):
+    """When --resume fails with a session-not-found error, retry without --resume."""
+    calls = []
+
+    def fake(cmd, cwd, env, pool):
+        calls.append(cmd)
+        # First call (with --resume) fails with session not found
+        if "--resume" in cmd:
+            return _FakeProc("", returncode=1), "Error: session not found or expired"
+        # Second call (without --resume) succeeds
+        return _FakeProc(json.dumps({
+            "result": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })), "blob"
+
+    monkeypatch.setattr(runners, "_run", fake)
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    res = runners.ClaudeCodeRunner().run("PROMPT", cwd=".", resume="sess-stale")
+    assert len(calls) == 2  # retried once
+    assert res.ok is True  # final result is ok
+    # First call had --resume, second did not
+    assert "--resume" in calls[0]
+    assert "--resume" not in calls[1]
+
+
+def test_claude_runner_no_retry_on_unrelated_failure(monkeypatch):
+    """When --resume fails for a reason other than session-not-found, don't retry."""
+    calls = []
+
+    def fake(cmd, cwd, env, pool):
+        calls.append(cmd)
+        return _FakeProc("", returncode=1), "Some other error"
+
+    monkeypatch.setattr(runners, "_run", fake)
+    monkeypatch.setattr(config, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")
+    res = runners.ClaudeCodeRunner().run("PROMPT", cwd=".", resume="sess-abc")
+    assert len(calls) == 1  # no retry
+    assert res.ok is False  # failure is surfaced
+
+
+def test_glm_claude_runner_adds_resume_flag(monkeypatch):
+    """GLM via Claude Code also supports --resume."""
+    captured = {}
+
+    def fake(cmd, cwd, env, pool):
+        captured["cmd"] = cmd
+        return _FakeProc(json.dumps({
+            "result": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })), "blob"
+
+    monkeypatch.setattr(runners, "_run", fake)
+    monkeypatch.setattr(config, "ZAI_AUTH_TOKEN", "zai-x")
+    runners.GlmClaudeCodeRunner().run("PROMPT", cwd=".", model="glm-4.7",
+                                      resume="sess-xyz")
+    assert "--resume" in captured["cmd"]
+    assert "sess-xyz" in captured["cmd"]
+
+
+def test_glm_pi_runner_ignores_resume_parameter():
+    """Pi runner accepts resume for signature uniformity but ignores it."""
+    # Just verify the signature accepts it without error
+    runner = runners.GlmPiRunner()
+    # The method signature must accept resume
+    import inspect
+    sig = inspect.signature(runner.run)
+    assert "resume" in sig.parameters

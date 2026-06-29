@@ -133,9 +133,9 @@ class StubRunner:
         self._result = result
         self.seen = {}
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None, resume=None):
         self.seen = {"prompt": prompt, "cwd": cwd, "write": write,
-                     "model": model, "effort": effort, "schema": schema}
+                     "model": model, "effort": effort, "schema": schema, "resume": resume}
         return self._result
 
 
@@ -151,6 +151,7 @@ def test_run_routes_records_and_returns_family(monkeypatch):
     assert res is result
     assert runner.seen["prompt"] == "PROMPT"
     assert runner.seen["cwd"] == "/work"
+    assert runner.seen["resume"] is None  # no resume passed
     # claude stage runs with its pinned per-stage Claude model
     assert runner.seen["model"] == config.CLAUDE_MODEL_BY_STAGE["spec"]
     # With the new reserve/reconcile API:
@@ -242,13 +243,58 @@ def test_run_forwards_exclude_family(monkeypatch):
     assert captured["exclude"] == "claude"
 
 
+def test_run_forwards_resume_id_when_family_matches(monkeypatch):
+    """When resume family matches the chosen family, forward the session id."""
+    led = RecordingLedger()
+    runner = StubRunner("claude", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    resume_dict = {"family": "claude", "id": "sess-abc123"}
+    fam, res = stages._run("spec", led, "PROMPT", cwd="/w", resume=resume_dict)
+    assert runner.seen["resume"] == "sess-abc123"
+
+
+def test_run_skips_resume_when_family_mismatch(monkeypatch):
+    """When resume family doesn't match the chosen family, don't forward the id."""
+    led = RecordingLedger()
+    runner = StubRunner("glm", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "glm")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    # Resume is for claude but router picks glm
+    resume_dict = {"family": "claude", "id": "sess-abc123"}
+    fam, res = stages._run("spec", led, "PROMPT", cwd="/w", resume=resume_dict)
+    assert runner.seen["resume"] is None  # not forwarded due to family mismatch
+
+
+def test_run_handles_missing_resume_fields(monkeypatch):
+    """Gracefully handle resume dict with missing or None fields."""
+    led = RecordingLedger()
+    runner = StubRunner("claude", RunResult(ok=True, text=""))
+    monkeypatch.setattr(stages.router, "choose_family", lambda *a, **k: "claude")
+    monkeypatch.setattr(stages.runners, "get_runner", lambda fam: runner)
+
+    # Missing "id" field
+    stages._run("spec", led, "PROMPT", cwd="/w", resume={"family": "claude"})
+    assert runner.seen["resume"] is None
+
+    # Missing "family" field
+    stages._run("spec", led, "PROMPT", cwd="/w", resume={"id": "sess-abc"})
+    assert runner.seen["resume"] is None
+
+    # None resume
+    stages._run("spec", led, "PROMPT", cwd="/w", resume=None)
+    assert runner.seen["resume"] is None
+
+
 class _RLRunner:
     """A runner that raises RateLimited for named families, else returns ok."""
     def __init__(self, family, rate_limited):
         self.family = family
         self._rl = rate_limited
 
-    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None):
+    def run(self, prompt, cwd, write=False, model=None, effort="medium", schema=None, resume=None):
         if self.family in self._rl:
             raise stages.RateLimited(self.family)
         return RunResult(ok=True, text="", input_tokens=1, output_tokens=1)
@@ -882,7 +928,9 @@ def test_implement_fan_out_all_units_processed(monkeypatch):
             if u["slug"] == slug:
                 u.update(kw)
                 break
-        saved[slug] = kw
+        if slug not in saved:
+            saved[slug] = {}
+        saved[slug].update(kw)
 
     monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     # Distinct paths per slug so mock_run can identify which unit is running.
@@ -954,7 +1002,9 @@ def test_implement_fan_out_re_raises_budget_parked(monkeypatch):
             if u["slug"] == slug:
                 u.update(kw)
                 break
-        saved[slug] = kw
+        if slug not in saved:
+            saved[slug] = {}
+        saved[slug].update(kw)
 
     monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
@@ -1009,7 +1059,9 @@ def test_implement_fan_out_re_raises_rate_limited(monkeypatch):
             if u["slug"] == slug:
                 u.update(kw)
                 break
-        saved[slug] = kw
+        if slug not in saved:
+            saved[slug] = {}
+        saved[slug].update(kw)
 
     monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
@@ -1042,3 +1094,155 @@ def test_implement_fan_out_re_raises_rate_limited(monkeypatch):
     # At least one successful unit persisted its state before re-raising
     assert len(saved) >= 1
     assert any(s.get("stage") == "review" for s in saved.values())
+
+
+# ── Session persistence and resume integration tests ────────────────────────────
+def test_spec_author_session_persisted_and_resumed_on_next_round(monkeypatch):
+    """Across two spec rounds, spec_author_session is persisted after round 0 and
+    a resume dict is passed to the author on round 1."""
+    meta = {}
+    runs = []  # captures (stage, prompt, resume_kwarg)
+
+    def fake_run_with_checkpoint(stage, ledger, prompt, cwd=None, resume=None, **k):
+        runs.append((stage, prompt, resume))
+        # Round 1 author
+        if stage == "spec" and len(runs) == 1:
+            return ("claude", RunResult(ok=True, text="",
+                                       data={"status": "ready", "specs": [{"title": "A"}]},
+                                       session_id="sess-author-round1"))
+        # Round 1 reviewer (concerns -> checkpoint)
+        if stage == "review" and len(runs) == 2:
+            return ("glm", RunResult(ok=True, text="",
+                                     data={"verdict": "concerns",
+                                           "concerns": ["fix the bug"]},
+                                     session_id="sess-reviewer-round1"))
+        # Round 2 author (should receive resume)
+        if stage == "spec" and len(runs) == 3:
+            return ("claude", RunResult(ok=True, text="",
+                                       data={"status": "ready", "specs": [{"title": "A"}]},
+                                       session_id="sess-author-round2"))
+        # Round 2 reviewer (ok -> publish)
+        if stage == "review" and len(runs) == 4:
+            return ("glm", RunResult(ok=True, text="",
+                                     data={"verdict": "ok", "concerns": []}))
+        # Default fallback (shouldn't happen in this test)
+        return ("claude", RunResult(ok=True, text="",
+                                   data={"status": "ready", "specs": []}))
+
+    monkeypatch.setattr(stages, "_run", fake_run_with_checkpoint)
+    monkeypatch.setattr(stages.repo, "ensure_repo", lambda n: "/p")
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_last_bot_summary", lambda gh, n: "S")
+    monkeypatch.setattr(stages, "issue_meta", lambda n: dict(meta))
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: meta.update(kw))
+
+    published = []
+    monkeypatch.setattr(stages, "_publish_specs",
+                        lambda gh, n, path, specs, round_note="":
+                        published.extend(specs))
+
+    gh = _SpecGH()
+
+    # Tick 1: round 1 author + reviewer (concerns raised -> checkpoint)
+    stages.handle_spec(gh, None, {"number": 1, "title": "T"})
+
+    # Assert spec_author_session was persisted after round 1
+    assert meta.get("spec_author_session") == {"family": "claude", "id": "sess-author-round1"}
+    assert meta.get("spec_round") == 1
+
+    # Tick 2: round 2 author should receive resume dict
+    stages.handle_spec(gh, None, {"number": 1, "title": "T"})
+
+    # Assert the third call (round 2 author) received the resume dict
+    assert runs[2][2] == {"family": "claude", "id": "sess-author-round1"}
+    # Assert published after round 2 (which also clears sessions via _reset_spec_loop)
+    assert len(published) == 1
+    # After publication, sessions are cleared
+    assert meta.get("spec_author_session") is None
+    assert meta.get("spec_round") == 0
+
+
+def test_reset_spec_loop_clears_sessions(monkeypatch):
+    """_reset_spec_loop clears spec_author_session and spec_reviewer_session."""
+    meta = {"spec_author_session": {"family": "claude", "id": "sess-1"},
+            "spec_reviewer_session": {"family": "glm", "id": "sess-2"}}
+
+    monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: meta.update(kw))
+
+    stages._reset_spec_loop(1)
+
+    assert meta.get("spec_author_session") is None
+    assert meta.get("spec_reviewer_session") is None
+
+
+def test_implement_session_persisted_and_resumed_on_fix_round(monkeypatch):
+    """Implement session is persisted on first pass and resumed on fix rounds."""
+    units = [{
+        "slug": "alpha", "title": "A", "branch": "b/alpha", "spec": {"title": "A"},
+        "stage": "implement", "pr_number": None, "review_round": 0,
+        "last_feedback": None, "implementer": None
+    }]
+
+    runs = []  # captures (stage, prompt, resume_kwarg)
+
+    def fake_run(stage, ledger, prompt, cwd=None, resume=None, **k):
+        runs.append((stage, prompt, resume))
+        # First pass implement
+        if stage == "implement" and len(runs) == 1:
+            return ("claude", RunResult(ok=True, text="",
+                                       data={"status": "done", "summary": "implemented"},
+                                       session_id="sess-implement-first"))
+        return ("claude", RunResult(ok=True, text="",
+                                   data={"status": "done", "summary": "fixed"}))
+
+    monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
+    saved = {}
+
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+        if slug not in saved:
+            saved[slug] = {}
+        saved[slug].update(kw)
+
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
+    monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
+    monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "push", lambda *a: None)
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
+    monkeypatch.setattr(stages, "_run", fake_run)
+
+    class _ImplGH:
+        def default_branch(self):
+            return "main"
+        def pull_for_branch(self, branch):
+            return None
+        def create_pull(self, title, head, base, body):
+            return {"number": 42}
+        def set_flow(self, n, flow, issue=None):
+            pass
+
+    gh = _ImplGH()
+
+    # First pass: implement the unit
+    stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+
+    # Assert implement_session was persisted
+    assert saved["alpha"].get("implement_session") == {"family": "claude",
+                                                        "id": "sess-implement-first"}
+
+    # Now simulate a fix round by setting review_round=1 and last_feedback
+    units[0]["review_round"] = 1
+    units[0]["last_feedback"] = "fix the bug"
+    units[0]["stage"] = "implement"  # back to implement for fix round
+    saved.clear()
+
+    # Fix round: should resume the session
+    stages.handle_implement(gh, None, {"number": 1, "title": "T"})
+
+    # Assert the second call received the resume dict
+    assert runs[1][2] == {"family": "claude", "id": "sess-implement-first"}
