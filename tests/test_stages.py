@@ -522,7 +522,13 @@ def test_implement_opens_pr_linking_issue_without_closing(monkeypatch):
     monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
     saved = {}
     monkeypatch.setattr(stages, "update_issue_meta", lambda n, **kw: saved.update(kw))
-    monkeypatch.setattr(stages, "_update_unit", lambda n, slug, **kw: saved.update({"spec_units": units}))  # Mock the new update function
+    # Properly mock _update_unit to actually update the unit in the list
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
     monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
     monkeypatch.setattr(stages.repo, "commit_all", lambda *a: None)
@@ -580,7 +586,13 @@ def test_review_approve_moves_unit_to_merge(monkeypatch):
               "last_feedback": None, "implementer": "glm"}]
     saved = {}
     monkeypatch.setattr(stages, "issue_meta", lambda n: {"spec_units": units})
-    monkeypatch.setattr(stages, "_update_unit", lambda n, slug, **kw: saved.update({"spec_units": units}))  # Mock the new update function
+    # Properly mock _update_unit to actually update the unit in the list
+    def mock_update_unit(n, slug, **kw):
+        for u in units:
+            if u["slug"] == slug:
+                u.update(kw)
+                break
+    monkeypatch.setattr(stages, "_update_unit", mock_update_unit)
     monkeypatch.setattr(stages.repo, "ensure_worktree", lambda *a: "/p")
     monkeypatch.setattr(stages.repo, "remove_worktree", lambda *a: None)
     monkeypatch.setattr(stages, "_discussion", lambda *a, **k: "D")
