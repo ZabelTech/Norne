@@ -129,6 +129,7 @@ def _specs_text(specs):
 
 
 def _record(ledger, fam, res):
+    """Simple post-charge path (legacy; still used where no reservation)."""
     if fam == "claude":
         ledger.record("claude", tokens=res.input_tokens + res.output_tokens)
     else:
@@ -136,9 +137,11 @@ def _record(ledger, fam, res):
 
 
 def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
-    """Route -> run -> meter. When a family is actually rate-limited by its
-    provider, cool it down and fall back to any other eligible family; park
-    (BudgetParked) only once EVERY family is out of budget / cooling."""
+    """Route -> reserve -> run -> reconcile. Reserve pre-charges an estimate so
+    the budget gate is atomic under concurrent runs; reconcile corrects to actual
+    usage after. When a family is actually rate-limited by its provider, refund
+    the reservation, cool it down, and fall back to any other eligible family;
+    park (BudgetParked) only once EVERY family is out of budget / cooling."""
     tried = set()
     while True:
         fam = router.choose_family(stage, ledger, exclude_family=exclude_family,
@@ -150,18 +153,43 @@ def _run(stage, ledger, prompt, cwd, exclude_family=None, write=False):
             raise BudgetParked()
         model = _model_for(stage, fam)
         effort = config.effort_for(model)
+
+        # Reserve an estimate before the run (atomic gate for concurrency).
+        if fam == "claude":
+            reserved_tokens, reserved_prompts = config.CLAUDE_RESERVE_TOKENS, 0
+        else:
+            reserved_tokens, reserved_prompts = 0, config.GLM_RESERVE_PROMPTS
+        if not ledger.reserve(fam, tokens=reserved_tokens, prompts=reserved_prompts):
+            # Pool exhausted between router choice and reservation -> try the next.
+            log(f"  {stage}: {fam} exhausted during reservation -> trying another family")
+            tried.add(fam)
+            continue
+
         log(f"  {stage}: calling {fam}/{model} ({effort})…")
         t0 = time.time()
         runner = runners.get_runner(fam)
         try:
             res = runner.run(prompt, cwd=cwd, write=write, model=model, effort=effort)
         except RateLimited:
+            # The run didn't happen: refund the reservation, cool the pool, fall back.
+            ledger.reconcile(fam, reserved_tokens=reserved_tokens,
+                             reserved_prompts=reserved_prompts,
+                             actual_tokens=0, actual_prompts=0)
             ledger.cool_down(fam, config.RATE_LIMIT_COOLDOWN)
             tried.add(fam)
             log(f"  {stage}: {fam} rate-limited by provider -> cooling "
                 f"{config.RATE_LIMIT_COOLDOWN}s, falling back to another family")
             continue
-        _record(ledger, fam, res)
+
+        # Reconcile the estimate to actual usage.
+        if fam == "claude":
+            actual_tokens, actual_prompts = res.input_tokens + res.output_tokens, 0
+        else:
+            actual_tokens, actual_prompts = 0, math.ceil(config.GLM_QUOTA_MULTIPLIER)
+        ledger.reconcile(fam, reserved_tokens=reserved_tokens,
+                         reserved_prompts=reserved_prompts,
+                         actual_tokens=actual_tokens, actual_prompts=actual_prompts)
+
         log(f"  {stage}: {model} returned in {int(time.time() - t0)}s "
             f"({_fmt_tokens(res.input_tokens + res.output_tokens)}, ok={res.ok})")
         return fam, res
@@ -370,6 +398,35 @@ def _save_units(n, units):
     update_issue_meta(n, spec_units=units)
 
 
+def _update_unit(n, slug, **changes):
+    """Update a single unit's fields atomically — for concurrent workers.
+
+    Under the store path lock, reload spec_units, update ONLY the unit matching
+    `slug`, and save. Each worker persists its own unit without clobbering
+    siblings. Uses _load/_save directly to avoid re-acquiring the non-reentrant
+    lock (issue_meta/update_issue_meta each acquire the same lock).
+    """
+    from . import store
+    lock = store._lock_for(store.ISSUES_PATH)
+    with lock:
+        # Load, modify, save inline — do NOT call issue_meta() or update_issue_meta()
+        # since they re-acquire the same non-reentrant lock and would deadlock.
+        data = store._load(store.ISSUES_PATH, {})
+        issue_data = data.get(str(n), {})
+        units = issue_data.get("spec_units", [])
+        updated = []
+        for u in units:
+            if u.get("slug") == slug:
+                updated_u = u.copy()
+                updated_u.update(changes)
+                updated.append(updated_u)
+            else:
+                updated.append(u)
+        issue_data["spec_units"] = updated
+        data[str(n)] = issue_data
+        store._save(store.ISSUES_PATH, data)
+
+
 def _advance(gh, n, units, issue=None):
     """Set the issue's aggregate flow from the per-unit stages — implement until
     every spec has an open PR, then review, then merge — and close the issue once
@@ -389,7 +446,8 @@ def _advance(gh, n, units, issue=None):
 
 def _publish_specs(gh, n, path, specs, round_note=""):
     """Reviewer is happy: give each spec its OWN branch with just that spec
-    committed (no sub-issues), then move to implement."""
+    committed (no sub-issues), then move to implement. Leaves the primary on
+    a detached HEAD so `ensure_worktree` never hits 'branch already checked out'."""
     base = gh.default_branch()
     units = []
     for i, s in enumerate(specs):
@@ -401,6 +459,9 @@ def _publish_specs(gh, n, path, specs, round_note=""):
         units.append({"slug": slug, "title": s.get("title", ""), "branch": branch,
                       "spec": s, "stage": "implement", "pr_number": None,
                       "review_round": 0, "last_feedback": None, "implementer": None})
+    # Leave the primary on a non-spec ref so `ensure_worktree` never fails with
+    # 'branch already checked out in another worktree'.
+    repo._git(["checkout", "--detach", f"origin/{base}"], path)
     update_issue_meta(n, spec_units=units, specs=specs, branch=None,
                       review_round=0, human_guidance=None, pending_specs=None)
     gh.set_flow(n, config.FLOW_IMPLEMENT, gh.get_issue(n))
@@ -425,104 +486,217 @@ def _escalate_spec(gh, n, specs, reason, round_note=""):
 
 
 def handle_implement(gh, ledger, issue):
-    """Implement the next spec that still needs code (or a fix round), on its own
-    branch, and open a PR linking the issue. One spec per tick."""
+    """Implement ALL specs that still need code (or a fix round), on their own
+    branches via worktrees, and open PRs linking the issue. Fan-out to process
+    all eligible units concurrently, one thread + worktree per unit."""
+    import concurrent.futures
+
     n = issue["number"]
     units = _units(issue_meta(n), "implement")
-    u = next((x for x in units if x["stage"] == "implement"), None)
-    if u is None:                                        # nothing left to implement
+    implement_units = [u for u in units if u["stage"] == "implement"]
+
+    if not implement_units:                             # nothing left to implement
         _advance(gh, n, units, issue)
         return
-    path = repo.ensure_repo(n)
-    repo.checkout_branch(path, u["branch"], gh.default_branch())
-    rnd = u.get("review_round", 0)
-    discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
-    if rnd > 0 and u.get("last_feedback"):              # fix iteration
-        prompt = _build_prompt(prompts.FIX, "fix", path, NUM=n, ROUND=rnd,
-                               FEEDBACK=u["last_feedback"], DISCUSSION=discussion)
+
+    base = gh.default_branch()
+
+    def _implement_one(u):
+        """Worker: run one implement unit in a worktree."""
+        slug = u["slug"]
+        path = repo.ensure_worktree(n, slug, u["branch"], base)
+        try:
+            rnd = u.get("review_round", 0)
+            discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
+            if rnd > 0 and u.get("last_feedback"):              # fix iteration
+                prompt = _build_prompt(prompts.FIX, "fix", path, NUM=n, ROUND=rnd,
+                                       FEEDBACK=u["last_feedback"], DISCUSSION=discussion)
+            else:
+                prompt = _build_prompt(prompts.IMPLEMENT, "implement", path, NUM=n,
+                                       DISCUSSION=discussion)
+            log(f"[#{n}] implement {slug}: "
+                f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
+            fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
+
+            if res.data.get("status") != "done":
+                reason = _implement_escalation(res, path, base)
+                return {"slug": slug, "status": "escalate", "reason": reason}
+
+            repo.commit_all(path, f"implement #{n} {slug}"
+                            + (f" (fix round {rnd})" if rnd else ""))
+            repo.push(path, u["branch"])
+            pr = gh.pull_for_branch(u["branch"])
+            if not pr:
+                body = (f"{res.data.get('summary','')}\n\nPart of #{n}\n\n"
+                        f"_Spec: `specs/{n}/{slug}.md`. Implemented by **{fam}**._")
+                pr = gh.create_pull(title=f"{issue['title']} — {u['title']}",
+                                    head=u["branch"], base=base, body=body)
+            return {"slug": slug, "status": "done", "pr_number": pr["number"],
+                    "implementer": fam}
+        finally:
+            repo.remove_worktree(n, path)
+
+    # Fan-out: process all implement units concurrently.
+    results = []
+    budget_or_rate_limited = False
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.MAX_SPEC_WORKERS) as executor:
+        futures = {executor.submit(_implement_one, u): u for u in implement_units}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                results.append(fut.result())
+            except (BudgetParked, RateLimited) as e:
+                u = futures[fut]
+                log(f"[#{n}] implement {u['slug']}: {type(e).__name__} -> will park")
+                results.append({"slug": u["slug"], "status": "parked", "exception": e})
+                budget_or_rate_limited = True
+            except Exception as e:
+                u = futures[fut]
+                log(f"[#{n}] implement {u['slug']}: raised {e}")
+                results.append({"slug": u["slug"], "status": "error", "reason": str(e)})
+
+    # Persist outcomes and escalate if any unit needs human.
+    escalation_reasons = []
+    for r in results:
+        if r["status"] == "done":
+            slug = r["slug"]
+            _update_unit(n, slug, pr_number=r["pr_number"],
+                         implementer=r["implementer"], stage="review")
+            log(f"[#{n}] implement {slug}: done by {r['implementer']} -> PR #{r['pr_number']}")
+        elif r["status"] == "parked":
+            # Budget/rate-limit units are already logged; don't escalate yet
+            pass
+        elif r["status"] in ("escalate", "error"):
+            escalation_reasons.append(
+                f"`{r['slug']}`: {r.get('reason', 'unknown failure')}")
+            log(f"[#{n}] implement {r['slug']}: {r['status']} -> escalate (human:needed)")
+
+    # If any unit hit budget/rate-limit, re-raise so process_issue parks the issue.
+    if budget_or_rate_limited:
+        # Find the first budget/rate-limit exception and re-raise it
+        for r in results:
+            if r["status"] == "parked":
+                raise r["exception"]
+
+    if escalation_reasons:
+        combined = "\n\n".join(escalation_reasons)
+        _pause(gh, n, f"One or more implement units hit a blocker:\n\n{combined}")
     else:
-        prompt = _build_prompt(prompts.IMPLEMENT, "implement", path, NUM=n,
-                               DISCUSSION=discussion)
-    log(f"[#{n}] implement {u['slug']}: "
-        f"{'fix round ' + str(rnd) if rnd else 'first pass'}")
-    fam, res = _run("implement", ledger, prompt, cwd=path, write=True)
-    if res.data.get("status") != "done":
-        log(f"[#{n}] implement {u['slug']}: not done (ok={res.ok}, "
-            f"dirty={len(repo.dirty_files(path))}) -> escalate (human:needed)")
-        _pause(gh, n, _implement_escalation(res, path, gh.default_branch()))
-        return
-    repo.commit_all(path, f"implement #{n} {u['slug']}"
-                    + (f" (fix round {rnd})" if rnd else ""))
-    repo.push(path, u["branch"])
-    pr = gh.pull_for_branch(u["branch"])
-    if not pr:
-        # "Part of #n" links the issue WITHOUT auto-closing it on merge — the issue
-        # closes only once every spec PR has merged (see _advance).
-        body = (f"{res.data.get('summary','')}\n\nPart of #{n}\n\n"
-                f"_Spec: `specs/{n}/{u['slug']}.md`. Implemented by **{fam}**._")
-        pr = gh.create_pull(title=f"{issue['title']} — {u['title']}", head=u["branch"],
-                            base=gh.default_branch(), body=body)
-    u["pr_number"], u["implementer"], u["stage"] = pr["number"], fam, "review"
-    _save_units(n, units)
-    log(f"[#{n}] implement {u['slug']}: done by {fam} -> PR #{pr['number']}")
-    _advance(gh, n, units, issue)
+        _advance(gh, n, _units(issue_meta(n)), issue)
 
 
 def handle_review(gh, ledger, issue):
-    """Review the next spec PR awaiting review, cross-model. One spec per tick."""
+    """Review ALL spec PRs awaiting review, cross-model. Fan-out to process
+    all eligible units concurrently, one thread + worktree per unit."""
+    import concurrent.futures
+
     n = issue["number"]
     units = _units(issue_meta(n), "review")
-    u = next((x for x in units if x["stage"] == "review"), None)
-    if u is None:
+    review_units = [u for u in units if u["stage"] == "review"]
+
+    if not review_units:                                # nothing left to review
         _advance(gh, n, units, issue)
         return
+
     base = gh.default_branch()
-    branch = u["branch"]
-    # Check the PR branch out (base fetched + pulled too) so the reviewer can run
-    # git diff itself against the target branch and inspect the whole tree.
-    path = repo.ensure_repo(n)
-    repo.checkout_branch(path, branch, base)
     summary = _last_bot_summary(gh, n)
-    discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
-    prompt = _build_prompt(prompts.REVIEW, "review", path, NUM=n, TITLE=issue["title"],
-                           SUMMARY=summary, SPECS=_specs_text([u["spec"]]),
-                           BRANCH=branch, BASE=base, DISCUSSION=discussion)
-    # cross-check: review with the OTHER family than implemented
-    fam, res = _run("review", ledger, prompt, cwd=path,
-                    exclude_family=u.get("implementer"))
-    model = _model_for("review", fam)
-    effort = config.effort_for(model)
-    tok = res.input_tokens + res.output_tokens
-    status = res.data.get("status")
-    if status == "approve":
-        # Review feedback goes on the PR (the code under review), not the issue.
-        gh.comment(u["pr_number"], f"✅ **Review passed** (by {fam}).\n\n"
-                                   f"{res.data.get('summary','')}",
-                   model=model, effort=effort, tokens=tok)
-        u["stage"] = "merge"
-        _save_units(n, units)
-        log(f"[#{n}] review {u['slug']}: approved by {fam}")
-        _advance(gh, n, units, issue)
-    elif status == "request_changes":
-        rnd = u.get("review_round", 0) + 1
-        if rnd > config.MAX_REVIEW_ROUNDS:
-            log(f"[#{n}] review {u['slug']}: still failing after "
-                f"{config.MAX_REVIEW_ROUNDS} rounds -> escalate (human:needed)")
-            _pause(gh, n, f"`{u['slug']}` still failing review after "
-                          f"{config.MAX_REVIEW_ROUNDS} rounds. Take a look.")
-            return
-        fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
-             res.data.get("summary", "")
-        # Review feedback goes on the PR (the code under review), not the issue.
-        gh.comment(u["pr_number"], f"🔁 **Changes requested** (round {rnd}, by {fam}):\n{fb}",
-                   model=model, effort=effort, tokens=tok)
-        u["review_round"], u["last_feedback"], u["stage"] = rnd, fb, "implement"
-        _save_units(n, units)
-        log(f"[#{n}] review {u['slug']}: changes requested (round {rnd}, by {fam})")
-        _advance(gh, n, units, issue)
+
+    def _review_one(u):
+        """Worker: run one review unit in a worktree."""
+        slug = u["slug"]
+        path = repo.ensure_worktree(n, slug, u["branch"], base)
+        try:
+            discussion = _discussion(gh, n, issue=issue, pr_number=u.get("pr_number"))
+            prompt = _build_prompt(prompts.REVIEW, "review", path, NUM=n, TITLE=issue["title"],
+                                   SUMMARY=summary, SPECS=_specs_text([u["spec"]]),
+                                   BRANCH=u["branch"], BASE=base, DISCUSSION=discussion)
+            # cross-check: review with the OTHER family than implemented
+            fam, res = _run("review", ledger, prompt, cwd=path,
+                            exclude_family=u.get("implementer"))
+
+            model = _model_for("review", fam)
+            effort = config.effort_for(model)
+            tok = res.input_tokens + res.output_tokens
+            status = res.data.get("status")
+
+            if status == "approve":
+                return {"slug": slug, "status": "approve", "family": fam,
+                        "summary": res.data.get("summary", ""),
+                        "model": model, "effort": effort, "tokens": tok}
+            elif status == "request_changes":
+                rnd = u.get("review_round", 0) + 1
+                if rnd > config.MAX_REVIEW_ROUNDS:
+                    return {"slug": slug, "status": "escalate",
+                            "reason": f"still failing after {config.MAX_REVIEW_ROUNDS} rounds"}
+                fb = "\n".join(f"- {c}" for c in res.data.get("comments", [])) or \
+                     res.data.get("summary", "")
+                return {"slug": slug, "status": "request_changes", "round": rnd,
+                        "family": fam, "feedback": fb, "model": model,
+                        "effort": effort, "tokens": tok}
+            else:
+                return {"slug": slug, "status": "escalate",
+                        "reason": _failure_reason(res, "Review flagged a judgement call.")}
+        finally:
+            repo.remove_worktree(n, path)
+
+    # Fan-out: process all review units concurrently.
+    results = []
+    budget_or_rate_limited = False
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.MAX_SPEC_WORKERS) as executor:
+        futures = {executor.submit(_review_one, u): u for u in review_units}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                results.append(fut.result())
+            except (BudgetParked, RateLimited) as e:
+                u = futures[fut]
+                log(f"[#{n}] review {u['slug']}: {type(e).__name__} -> will park")
+                results.append({"slug": u["slug"], "status": "parked", "exception": e})
+                budget_or_rate_limited = True
+            except Exception as e:
+                u = futures[fut]
+                log(f"[#{n}] review {u['slug']}: raised {e}")
+                results.append({"slug": u["slug"], "status": "escalate",
+                                "reason": str(e)})
+
+    # Persist outcomes and escalate if any unit needs human.
+    escalation_reasons = []
+    for r in results:
+        slug = r["slug"]
+        pr_number = next(u["pr_number"] for u in units if u["slug"] == slug)
+        if r["status"] == "approve":
+            # Review feedback goes on the PR (the code under review), not the issue.
+            gh.comment(pr_number, f"✅ **Review passed** (by {r['family']}).\n\n{r['summary']}",
+                       model=r["model"], effort=r["effort"], tokens=r["tokens"])
+            _update_unit(n, slug, stage="merge")
+            log(f"[#{n}] review {slug}: approved by {r['family']}")
+        elif r["status"] == "request_changes":
+            # Review feedback goes on the PR (the code under review), not the issue.
+            gh.comment(pr_number, f"🔁 **Changes requested** (round {r['round']}, "
+                       f"by {r['family']}):\n{r['feedback']}",
+                       model=r["model"], effort=r["effort"], tokens=r["tokens"])
+            _update_unit(n, slug, review_round=r["round"],
+                         last_feedback=r["feedback"], stage="implement")
+            log(f"[#{n}] review {slug}: changes requested (round {r['round']}, by {r['family']})")
+        elif r["status"] == "escalate":
+            escalation_reasons.append(f"`{slug}`: {r.get('reason', 'unknown failure')}")
+            log(f"[#{n}] review {slug}: escalate (human:needed)")
+        elif r["status"] == "parked":
+            # Budget/rate-limit units are already logged; don't escalate yet
+            pass
+
+    # If any unit hit budget/rate-limit, re-raise so process_issue parks the issue.
+    if budget_or_rate_limited:
+        # Find the first budget/rate-limit exception and re-raise it
+        for r in results:
+            if r["status"] == "parked":
+                raise r["exception"]
+
+    if escalation_reasons:
+        combined = "\n\n".join(escalation_reasons)
+        _pause(gh, n, f"One or more review units hit a blocker:\n\n{combined}")
     else:
-        log(f"[#{n}] review {u['slug']}: needs_human -> escalate")
-        _pause(gh, n, _failure_reason(res, "Review flagged a judgement call."))
+        _advance(gh, n, _units(issue_meta(n)), issue)
 
 
 def handle_merge(gh, ledger, issue):

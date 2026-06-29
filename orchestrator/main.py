@@ -1,13 +1,13 @@
 """Poll loop. One Machine, one writer over the GitHub state machine.
 
 The poll loop never blocks on a model call: it just discovers triggered/in-flight
-issues and hands each to a SINGLE background worker thread, which advances one
-issue at a time. One worker preserves the single-writer invariant (no concurrent
-state writes) while keeping the main loop responsive (it keeps polling, logging,
-and picking up new comments/labels while a model call runs). The budget gate
-(ledger) and the 429 backstop both funnel into a `blocked:budget` park.
+issues and hands each to a bounded worker pool (Level 1 concurrency). The
+shared Ledger + per-path store locks preserve correctness under concurrency
+(the budget reservation gate prevents window overrun, and the inflight guard
+ensures at-most-one-worker-per-issue). The 429 backstop funnels into a
+`blocked:budget` park.
 """
-import queue
+import concurrent.futures
 import threading
 import time
 import traceback
@@ -110,49 +110,61 @@ def candidates(gh):
     return out
 
 
-def _worker(gh, work, inflight, lock):
-    """Process one issue at a time off the queue (the single writer)."""
-    while True:
-        issue = work.get()
-        n = issue["number"]
-        t0 = time.time()
+def _done_callback(n, inflight, lock, t0):
+    """Called when a process_issue task completes: remove from inflight and log."""
+    def callback(fut):
         try:
-            process_issue(gh, Ledger(), issue)       # fresh ledger view per issue
-        except Exception as e:                        # never let one issue kill the worker
+            fut.result()  # re-raises if the task raised
+            log(f"[#{n}] worker done ({int(time.time() - t0)}s)")
+        except Exception as e:
             log(f"[#{n}] worker error: {e}")
             traceback.print_exc()
         finally:
-            log(f"[#{n}] worker done ({int(time.time() - t0)}s)")
             with lock:
                 inflight.discard(n)
-            work.task_done()
+    return callback
+
+
+def dispatch_once(gh, executor, ledger, inflight, lock):
+    """One poll iteration: find candidates, dispatch up to MAX_WORKERS, log.
+
+    Extracted as a testable unit — the tests drive ONE iteration without
+    the infinite loop.
+    """
+    cands = candidates(gh)
+    dispatched, busy = [], []
+    for issue in cands:
+        n = issue["number"]
+        with lock:
+            if n in inflight:                # already queued or in progress
+                busy.append(n)
+                continue
+            inflight.add(n)
+        t0 = time.time()
+        fut = executor.submit(process_issue, gh, ledger, issue)
+        fut.add_done_callback(_done_callback(n, inflight, lock, t0))
+        dispatched.append(n)
+    if cands:                                # only log polls that saw work
+        log(f"poll: candidates={[i['number'] for i in cands]} "
+            f"dispatched={dispatched} in-flight(skipped)={busy}")
 
 
 def main():
     gh = GitHub()
     log(f"orchestrator up — repo={config.GH_REPO} glm_runner={config.GLM_RUNNER} "
-        f"tier={config.GLM_TIER} auto_merge={config.AUTO_MERGE} poll={config.POLL_INTERVAL}s")
-    work = queue.Queue()
+        f"tier={config.GLM_TIER} auto_merge={config.AUTO_MERGE} poll={config.POLL_INTERVAL}s "
+        f"max_workers={config.MAX_WORKERS}")
+    # One shared ledger for all workers — the reservation gate prevents races.
+    ledger = Ledger()
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=config.MAX_WORKERS,
+        thread_name_prefix="worker"
+    )
     inflight = set()
     lock = threading.Lock()
-    threading.Thread(target=_worker, args=(gh, work, inflight, lock),
-                     name="worker", daemon=True).start()
     while True:
         try:
-            cands = candidates(gh)
-            dispatched, busy = [], []
-            for issue in cands:
-                n = issue["number"]
-                with lock:
-                    if n in inflight:                # already queued or in progress
-                        busy.append(n)
-                        continue
-                    inflight.add(n)
-                work.put(issue)
-                dispatched.append(n)
-            if cands:                                # only log polls that saw work
-                log(f"poll: candidates={[i['number'] for i in cands]} "
-                    f"dispatched={dispatched} in-flight(skipped)={busy}")
+            dispatch_once(gh, executor, ledger, inflight, lock)
         except Exception as e:
             log(f"loop error: {e}")
             traceback.print_exc()

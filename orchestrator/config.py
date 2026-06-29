@@ -1,4 +1,5 @@
 """Central config, state-machine constants, and the model routing table."""
+import math
 import os
 
 
@@ -29,6 +30,10 @@ TRIGGER_LABEL = os.environ.get("TRIGGER_LABEL", "pipeline")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 WORKDIR_ROOT = os.environ.get("WORKDIR_ROOT", os.path.join(DATA_DIR, "work"))
+
+# ── Concurrency (Level 1 + Level 2) ─────────────────────────────────────────
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "1"))          # pooled workers across issues
+MAX_SPEC_WORKERS = int(os.environ.get("MAX_SPEC_WORKERS", str(MAX_WORKERS)))  # per-issue spec fan-out
 
 # ── Instructions (two-layer: general + per-stage) ────────────────────────
 # Instructions directory lives at the repo root (config.py is at orchestrator/config.py)
@@ -77,6 +82,13 @@ CLAUDE_CACHE_READ_WEIGHT = float(os.environ.get("CLAUDE_CACHE_READ_WEIGHT", "0.1
 # quota, so without a cooldown the blocked:budget gate un-parks on stale local
 # headroom and retries the same dead family every poll (a tight thrash loop).
 RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "600"))  # 10 min
+
+# Budget reservation estimates — deliberately generous to handle concurrent runs.
+# N concurrent model subprocesses multiply token/prompt spend, so we pre-charge
+# conservatively to prevent window overrun.
+CLAUDE_RESERVE_TOKENS = int(os.environ.get("CLAUDE_RESERVE_TOKENS", "200000"))
+GLM_RESERVE_PROMPTS = int(os.environ.get("GLM_RESERVE_PROMPTS",
+                                         str(math.ceil(GLM_QUOTA_MULTIPLIER))))
 
 # ── State machine: one flow:* label = where an issue is right now ──────────
 FLOW_SUMMARIZE = "flow:summarize"
