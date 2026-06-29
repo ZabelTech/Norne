@@ -56,6 +56,14 @@ def dirty_files(path):
     return [ln[3:] for ln in out.splitlines() if ln.strip()] if out else []
 
 
+def local_commits(path, base):
+    """Commit subjects on HEAD not yet on origin/<base> — work the agent committed
+    on its branch (whether or not it was pushed). Lets an escalation distinguish
+    'wrote nothing' from 'committed a lot but the run died before it was done'."""
+    out = _git(["log", "--oneline", f"origin/{base}..HEAD"], path).stdout.strip()
+    return out.splitlines() if out else []
+
+
 def commit_all(path, msg):
     _git(["add", "-A"], path)
     # commit only if there's something staged

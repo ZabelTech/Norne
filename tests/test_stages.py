@@ -265,6 +265,37 @@ def test_implement_escalation_falls_back_when_nothing_known(monkeypatch):
     assert r == "Implementation hit a blocker."
 
 
+def test_implement_escalation_surfaces_subprocess_output_on_crash(monkeypatch):
+    # A non-zero exit (not a timeout) must include the subprocess's actual output
+    # so the crash is diagnosable — this is the #5 blind spot.
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    res = RunResult(ok=False, text="", data={},
+                    raw="...\nz.ai: 503 upstream error\nfatal: stream closed")
+    r = stages._implement_escalation(res, "/w")
+    assert "exited with an error" in r
+    assert "z.ai: 503 upstream error" in r               # raw output surfaced
+    assert "Subprocess output" in r
+
+
+def test_implement_escalation_reports_committed_work(monkeypatch):
+    # When the agent committed a feature but the run died before `done`, say so —
+    # don't imply nothing was written.
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: ["tests/test_x.py"])
+    monkeypatch.setattr(stages.repo, "local_commits",
+                        lambda path, base: ["21ba79b Implement the feature",
+                                            "WIP tests"])
+    res = RunResult(ok=False, text="", data={}, raw="boom")
+    r = stages._implement_escalation(res, "/w", base="main")
+    assert "2 commit(s)" in r and "Implement the feature" in r
+    assert "1 uncommitted file(s)" in r                  # both states reported
+
+
+def test_implement_escalation_timeout_skips_raw_dump(monkeypatch):
+    monkeypatch.setattr(stages.repo, "dirty_files", lambda path: [])
+    r = stages._implement_escalation(RunResult(ok=False, text="", data={}, raw="timeout"), "/w")
+    assert "time limit" in r and "Subprocess output" not in r
+
+
 def test_pause_records_comment_baseline(monkeypatch):
     posted = {}
 

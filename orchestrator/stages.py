@@ -60,24 +60,35 @@ def _failure_reason(res, default):
     return default
 
 
-def _implement_escalation(res, path):
+def _implement_escalation(res, path, base=None):
     """A precise reason when an implement/fix run didn't report `done`. Tells the
-    human *how* it failed: a timed-out / crashed process vs. an agent that wrote
-    code but never emitted its result block — and lists the uncommitted files it
-    left in the checkout so the work isn't silently stranded."""
+    human *how* it failed (timed out vs. the subprocess crashed — with the actual
+    error output) and what state it left behind: commits the agent made on its
+    branch AND any still-uncommitted files, so the work isn't silently stranded."""
     parts = []
-    if not res.ok:
+    raw = (res.raw or "").strip()
+    crashed = not res.ok
+    if crashed:
         parts.append("The implement run did not finish cleanly" + (
-            " — it hit the time limit." if (res.raw or "").strip() == "timeout"
+            " — it hit the time limit." if raw == "timeout"
             else " — the agent process exited with an error."))
+    # Work the agent committed on its branch (whether or not it was pushed) — so we
+    # don't misreport "nothing was committed" when a whole feature is sitting there.
+    committed = repo.local_commits(path, base) if base else []
+    if committed:
+        shown = "\n".join(f"- {c}" for c in committed[:10])
+        more = f"\n…and {len(committed) - 10} more" if len(committed) > 10 else ""
+        parts.append(f"It had already committed **{len(committed)} commit(s)** on the "
+                     f"branch (unpushed — the run never reported `done`):\n{shown}{more}")
     changed = repo.dirty_files(path)
     if changed:
         shown = "\n".join(f"- `{f}`" for f in changed[:20])
         more = f"\n…and {len(changed) - 20} more" if len(changed) > 20 else ""
-        parts.append(
-            f"It left **{len(changed)} uncommitted file(s)** in the work checkout — "
-            f"it changed code but never reported `done`, so nothing was committed or "
-            f"pushed:\n{shown}{more}")
+        parts.append(f"It also left **{len(changed)} uncommitted file(s)**:\n{shown}{more}")
+    # On a crash, surface the subprocess's own output so the failure is diagnosable
+    # (the orchestrator otherwise only logs a one-line ok=False summary).
+    if crashed and raw and raw != "timeout":
+        parts.append("Subprocess output (tail):\n```\n" + raw[-1200:] + "\n```")
     detail = _failure_reason(res, "")
     if detail:
         parts.append(detail)
@@ -424,7 +435,7 @@ def handle_implement(gh, ledger, issue):
     if res.data.get("status") != "done":
         log(f"[#{n}] implement {u['slug']}: not done (ok={res.ok}, "
             f"dirty={len(repo.dirty_files(path))}) -> escalate (human:needed)")
-        _pause(gh, n, _implement_escalation(res, path))
+        _pause(gh, n, _implement_escalation(res, path, gh.default_branch()))
         return
     repo.commit_all(path, f"implement #{n} {u['slug']}"
                     + (f" (fix round {rnd})" if rnd else ""))
